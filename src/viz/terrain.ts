@@ -47,6 +47,8 @@ const FRAG = /* glsl */ `
 #include <logdepthbuf_pars_fragment>
 uniform sampler2D uTex;
 uniform sampler2D uLut;
+uniform sampler2D uOverlay;
+uniform float uOverlayMix;
 uniform float uUseTex;
 uniform float uZMin;
 uniform float uZMax;
@@ -80,6 +82,10 @@ void main() {
     base = texture2D(uLut, vec2(t, 0.5)).rgb;
     if (vElev < 0.0) base = mix(vec3(0.36, 0.45, 0.50), vec3(0.16, 0.25, 0.33), clamp(-vElev / 30.0, 0.0, 1.0));
   }
+  if (uOverlayMix > 0.0) {
+    vec4 o = texture2D(uOverlay, vUv);
+    base = mix(base, o.rgb, o.a * uOverlayMix);
+  }
   float shade = uUseTex > 0.5 ? (0.55 + 0.6 * diff) : (0.32 + 0.8 * diff);
   vec3 col = base * shade;
   if (uContour > 0.5) {
@@ -103,6 +109,8 @@ export class TerrainLayer {
       uniforms: {
         uTex: { value: null },
         uLut: { value: terrainLutTexture() },
+        uOverlay: { value: null },
+        uOverlayMix: { value: 0 },
         uUseTex: { value: 0 },
         uZMin: { value: 0 },
         uZMax: { value: 1 },
@@ -156,6 +164,32 @@ export class TerrainLayer {
     this.texture = tex;
     this.material.uniforms.uTex.value = tex;
     this.material.uniforms.uUseTex.value = tex ? 1 : 0;
+  }
+
+  /** Per-cell RGBA overlay (row 0 = south), blended by its alpha; null removes it. */
+  setOverlay(o: { data: Uint8Array; nx: number; ny: number } | null, mix: number): void {
+    const u = this.material.uniforms;
+    (u.uOverlay.value as THREE.Texture | null)?.dispose();
+    if (!o) {
+      u.uOverlay.value = null;
+      u.uOverlayMix.value = 0;
+      return;
+    }
+    const tex = new THREE.DataTexture(o.data, o.nx, o.ny, THREE.RGBAFormat, THREE.UnsignedByteType);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.needsUpdate = true;
+    u.uOverlay.value = tex;
+    u.uOverlayMix.value = mix;
+  }
+
+  /** Move vertices to new bed elevations (gates / breaches). */
+  setHeights(z: ArrayLike<number>): void {
+    if (!this.mesh) return;
+    const attr = this.mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const p = attr.array as Float32Array;
+    for (let k = 0; k < z.length; k++) p[3 * k + 1] = z[k];
+    attr.needsUpdate = true;
   }
 
   setContours(on: boolean, interval: number): void {

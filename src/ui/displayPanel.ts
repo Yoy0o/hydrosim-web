@@ -1,5 +1,6 @@
 /** Right panel: display settings, live statistics and data attribution. */
-import type { App } from '../app';
+import { ROUGH_RANGE, roughColor, type App } from '../app';
+import { LANDCOVER_CLASSES } from '../model';
 import type { ColorMode, ColormapName, ViewSettings } from '../types';
 import { COLORMAPS, COLOR_MODES } from '../viz/colormaps';
 import { checkRow, el, fmt, fmtTime, fmtVolume, icon, kids, numRow, row, select, selectRow } from './dom';
@@ -16,13 +17,54 @@ function slider(value: number, min: number, max: number, step: number, onInput: 
   return el('span', { class: 'slider-wrap' }, inp, out);
 }
 
+/** Legend of the terrain overlay (roughness ramp, land-cover classes or building coverage). */
+function overlayLegend(app: App): HTMLElement {
+  const mode = app.view.terrainOverlay;
+  if (mode === 'roughness') {
+    const stops = Array.from({ length: 9 }, (_, k) => {
+      const [r, g, b] = roughColor(k / 8);
+      return `rgb(${r},${g},${b}) ${((k / 8) * 100).toFixed(1)}%`;
+    });
+    // ticks at 0.01 / 0.03 / 0.1 / 0.3 are almost evenly spaced on the log scale
+    const [lo, hi] = ROUGH_RANGE;
+    const ticks = [lo, 0.03, 0.1, hi];
+    return el(
+      'div',
+      { class: 'ov-legend' },
+      el('div', { class: 'lg-bar', style: { background: `linear-gradient(to right, ${stops.join(', ')})` } }),
+      el('div', { class: 'lg-ticks' }, ...ticks.map((x) => el('span', null, String(x)))),
+      el('div', { class: 'muted small' }, app.model?.manning ? '曼宁 n（对数色阶）：土地利用 + 分区 + 建筑物' : `全域均匀 n = ${app.scenario?.manning}`),
+    );
+  }
+  if (mode === 'landcover') {
+    const lc = app.aux.landcover;
+    if (!lc) return el('div', { class: 'ov-legend muted small' }, '尚未导入土地利用（在左侧"② 糙率与土地利用"中从 OpenStreetMap 导入）');
+    const present = new Uint8Array(LANDCOVER_CLASSES.length);
+    for (let c = 0; c < lc.cls.length; c++) present[lc.cls[c]] = 1;
+    return el(
+      'div',
+      { class: 'ov-legend lc-legend' },
+      ...LANDCOVER_CLASSES.filter((_, k) => k > 0 && present[k]).map((c) => el('span', null, el('i', { class: 'swatch', style: { background: c.color } }), c.label)),
+    );
+  }
+  const cov = app.model?.buildingCover;
+  if (!cov) return el('div', { class: 'ov-legend muted small' }, '无建筑物数据（导入 OSM 建筑物或手绘建筑物轮廓）');
+  return el(
+    'div',
+    { class: 'ov-legend' },
+    el('div', { class: 'lg-bar', style: { background: 'linear-gradient(to right, rgba(200,70,60,0.08), rgb(200,70,60))' } }),
+    el('div', { class: 'lg-ticks' }, el('span', null, '0%'), el('span', null, '50%'), el('span', null, '100%')),
+    el('div', { class: 'muted small' }, '网格内建筑物覆盖率（阻水模式下 ≥ 50% 的网格抬高）'),
+  );
+}
+
 export function buildDisplayPanel(root: HTMLElement, app: App): void {
   const statsBox = el('div', { class: 'stats' });
   const attrBox = el('div', { class: 'attrib' });
   const displayBox = el('div');
 
   let selfUpdate = false;
-  const STRUCTURAL: (keyof ViewSettings)[] = ['colorMode', 'autoRange', 'particles', 'contours', 'basemap', 'colormap'];
+  const STRUCTURAL: (keyof ViewSettings)[] = ['colorMode', 'autoRange', 'particles', 'contours', 'basemap', 'colormap', 'terrainOverlay'];
   const renderDisplay = (): void => {
     if (selfUpdate) return;
     const v = app.view;
@@ -81,6 +123,19 @@ export function buildDisplayPanel(root: HTMLElement, app: App): void {
       geoOk
         ? selectRow<ViewSettings['basemap']>('地形贴图', v.basemap, [['none', '分层设色'], ['satellite', '卫星影像 (Sentinel-2)'], ['osm', 'OpenStreetMap']], (b) => set({ basemap: b }))
         : null,
+      selectRow<ViewSettings['terrainOverlay']>(
+        '地形叠加',
+        v.terrainOverlay,
+        [
+          ['none', '无'],
+          ['roughness', '曼宁糙率 n'],
+          ['landcover', '土地利用类型'],
+          ['buildings', '建筑物覆盖率'],
+        ],
+        (o) => set({ terrainOverlay: o }),
+        '在地形上叠加显示模型输入（糙率场、土地利用、建筑物）',
+      ),
+      v.terrainOverlay !== 'none' ? overlayLegend(app) : null,
       checkRow('等高线', v.contours, (on) => set({ contours: on })),
       v.contours ? numRow('等高距', v.contourInterval, (x) => set({ contourInterval: Math.max(0.01, x) }), { unit: 'm', step: 1, min: 0.01 }) : null,
       checkRow('显示边界条件类型', v.showBoundaries, (on) => set({ showBoundaries: on })),
@@ -165,6 +220,10 @@ export function buildDisplayPanel(root: HTMLElement, app: App): void {
   app.on('simstate', () => renderStats(true));
   app.on('scenario', renderAttr);
   app.on('view', renderAttr);
+  // the overlay legend depends on model inputs (roughness edits, OSM imports)
+  app.on('scenario', () => {
+    if (app.view.terrainOverlay !== 'none') renderDisplay();
+  });
   renderDisplay();
   renderStats(true);
   renderAttr();

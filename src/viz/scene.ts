@@ -111,10 +111,10 @@ export class Viewer {
     this.callbacks.push(cb);
   }
 
-  setFrame(frame: GridFrame): void {
+  setFrame(frame: GridFrame, resetCamera = true): void {
     this.frame = frame;
     this.applyExaggeration();
-    this.resetCamera('3d');
+    if (resetCamera) this.resetCamera('3d');
   }
 
   setExaggeration(e: number): void {

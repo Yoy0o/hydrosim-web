@@ -253,6 +253,15 @@ export class WaterLayer {
     u.uRipple.value = Math.max(1, Math.min(dx, dy) * 0.6);
   }
 
+  /** Bed elevations of the vertices (gates / breaches move them). */
+  setHeights(z: ArrayLike<number>): void {
+    if (!this.mesh) return;
+    const attr = this.mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const p = attr.array as Float32Array;
+    for (let k = 0; k < z.length; k++) p[3 * k + 1] = z[k];
+    attr.needsUpdate = true;
+  }
+
   /** Upload a state: depth h, velocities u, v (cell arrays) and bed z. */
   update(h: ArrayLike<number>, u: ArrayLike<number> | null, v: ArrayLike<number> | null, z: ArrayLike<number>): void {
     if (!this.stateTex) return;

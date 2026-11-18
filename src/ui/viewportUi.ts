@@ -4,6 +4,7 @@ import { exportScreenshot } from '../io';
 import { COLOR_MODES, colormapCss } from '../viz/colormaps';
 import { button, el, fmt, fmtTime, icon, kids } from './dom';
 import { ICONS } from './icons';
+import { LINK_LABEL, STRUCTURE_LABEL } from './structuresPanel';
 
 const TOOLS: [Tool, string, string, string][] = [
   ['navigate', ICONS.navigate, '浏览', '左键平移 · 右键旋转 · 滚轮缩放'],
@@ -11,8 +12,15 @@ const TOOLS: [Tool, string, string, string][] = [
   ['section', ICONS.section, '断面', '单击断面起点与终点（Esc 退出）'],
   ['source', ICONS.source, '入流点', '单击放置点源入流（Esc 退出）'],
   ['region', ICONS.region, '水体多边形', '依次单击顶点，双击或回车完成；用于水库/溃坝初始水体'],
+  ['roughZone', ICONS.rough, '糙率分区', '依次单击顶点，双击或回车完成；分区内使用指定曼宁系数'],
+  ['building', ICONS.building, '建筑物', '依次单击轮廓顶点，双击或回车完成'],
+  ['structure', ICONS.levee, '结构线', '依次单击折线顶点，双击或回车完成'],
+  ['link', ICONS.link, '涵洞/泵站', '单击进口（取水点），再单击出口（排水点）'],
   ['pour', ICONS.pour, '注水', '按住左键持续注水（交互式试验），松开停止'],
 ];
+
+/** Tools whose hint shows the number of picked points. */
+const POINT_TOOLS: Tool[] = ['region', 'section', 'roughZone', 'building', 'structure', 'link'];
 
 export function buildViewportUi(viewport: HTMLElement, app: App): void {
   // ---------------------------------------------------------------- tool palette
@@ -41,15 +49,18 @@ export function buildViewportUi(viewport: HTMLElement, app: App): void {
   const hint = el('div', { class: 'vp-hint' });
   const renderHint = (): void => {
     const t = TOOLS.find(([k]) => k === app.tool)!;
+    let label = t[2];
     let txt = t[3];
     if (app.tool === 'pour') txt += `（流量 ${fmt(app.pourRate, 1)} m³/s）`;
-    if ((app.tool === 'region' || app.tool === 'section') && app.draft.length) txt += ` · 已选 ${app.draft.length} 点`;
-    hint.replaceChildren(el('b', null, t[2]), ' ', txt);
+    if (app.tool === 'structure') label = `结构线 · ${STRUCTURE_LABEL[app.structureKind]}`;
+    if (app.tool === 'link') label = LINK_LABEL[app.linkKind];
+    if (POINT_TOOLS.includes(app.tool) && app.draft.length) txt += ` · 已选 ${app.draft.length} 点`;
+    hint.replaceChildren(el('b', null, label), ' ', txt);
     hint.classList.toggle('active', app.tool !== 'navigate');
   };
   app.on('tool', renderHint);
   app.on('hover', () => {
-    if (app.tool === 'region' || app.tool === 'section') renderHint();
+    if (POINT_TOOLS.includes(app.tool)) renderHint();
   });
   renderHint();
 

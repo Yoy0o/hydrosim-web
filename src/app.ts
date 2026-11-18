@@ -1,12 +1,15 @@
 /** Application controller: scenario state, simulation worker, 3D layers, tools and result stores. */
 import * as THREE from 'three';
-import type { SolverParams } from './core/solver';
+import { lineBed, type SolverParams } from './core/solver';
+import { sampleSeries } from './core/timeseries';
 import { initialDepth, sectionCells } from './core/geometry';
 import { fillDepressions } from './core/hydro';
 import { BASEMAPS, loadBasemap } from './data/basemap';
+import { OSM_VECTOR_ATTRIBUTION, importOsmVector } from './data/osmVector';
+import { LANDCOVER_CLASSES, buildModelInputs, ensureScenarioDefaults, type BuildingRaster, type LandCoverRaster, type ModelInputs } from './model';
 import { DEFAULT_PRESET, PRESETS, defaultView, genericScenario } from './data/presets';
 import { FrameStore, SeriesStore, type ResultFrame } from './results';
-import type { ColorMode, LoadedCase, Scenario, Terrain, ViewSettings } from './types';
+import type { ColorMode, LinkKind, LoadedCase, Scenario, StructureKind, Terrain, ViewSettings } from './types';
 import { uid } from './types';
 import { COLOR_MODES, colormapTexture, robustRange } from './viz/colormaps';
 import { MarkerLayer } from './viz/markers';
@@ -34,7 +37,10 @@ export type AppEvent =
   | 'style'
   | 'engine';
 
-export type Tool = 'navigate' | 'probe' | 'section' | 'source' | 'region' | 'pour';
+export type Tool = 'navigate' | 'probe' | 'section' | 'source' | 'region' | 'pour' | 'roughZone' | 'building' | 'structure' | 'link';
+
+/** Tools that collect a polygon / polyline draft finished by double-click or Enter. */
+const DRAFT_TOOLS: Tool[] = ['region', 'roughZone', 'building', 'structure'];
 
 export interface HoverInfo {
   x: number;
@@ -55,7 +61,7 @@ export interface Envelopes {
   t: number;
 }
 
-export type ChangeKind = 'params' | 'initial' | 'observers' | 'markers' | 'settings';
+export type ChangeKind = 'params' | 'initial' | 'observers' | 'markers' | 'settings' | 'roughness' | 'links' | 'bed';
 
 export class App {
   readonly viewer: Viewer;
@@ -67,7 +73,16 @@ export class App {
   readonly series = new SeriesStore();
   readonly frames = new FrameStore(400);
 
+  /** Effective terrain used by the solver and views (buildings, levees, gates at t = 0 baked in). */
   terrain: Terrain | null = null;
+  /** Raw DEM as loaded. */
+  baseTerrain: Terrain | null = null;
+  /** Rasters imported from OpenStreetMap. */
+  aux: { buildings: BuildingRaster | null; landcover: LandCoverRaster | null } = { buildings: null, landcover: null };
+  model: ModelInputs | null = null;
+  structureKind: StructureKind = 'levee';
+  linkKind: LinkKind = 'culvert';
+  private dynT = NaN;
   scenario: Scenario | null = null;
   view: ViewSettings = defaultView();
   presetId: string | null = null;
@@ -158,11 +173,44 @@ export class App {
 
   loadCase(c: LoadedCase, keepView = false): void {
     this.pauseIfRunning();
-    this.terrain = c.terrain;
-    this.scenario = c.scenario;
+    this.baseTerrain = c.terrain;
+    this.scenario = ensureScenarioDefaults(c.scenario);
+    this.aux = { buildings: c.buildings ?? null, landcover: c.landcover ?? null };
     this.initialOverride = c.initialDepth ?? null;
     if (!keepView) this.view = { ...defaultView(), ...(c.scenario.view ?? {}) };
-    const t = c.terrain;
+    this.computeModel();
+    this.buildLayers(true);
+    this.terrainLayer.setTexture(null);
+    this.basemapCanvas = null;
+    this.resetResults();
+    this.selected = null;
+    this.draft = [];
+    const t = this.terrain!;
+    const L = Math.max(t.nx * t.dx, t.ny * t.dy);
+    this.pourRate = +Math.max(0.1, (L * L * 3e-4) / 60).toPrecision(2);
+    this.updateAttribution();
+    this.initWorker();
+    this.refreshMarkers();
+    this.updateOverlay();
+    this.applyStyle(true);
+    if (this.view.basemap !== 'none') void this.loadBasemapTexture(this.view.basemap);
+    this.emit('case');
+    this.emit('scenario');
+    this.emit('view');
+    this.emit('simstate');
+    this.emit('playback');
+  }
+
+  /** Effective bed and solver structures from the raw terrain and the scenario. */
+  private computeModel(): void {
+    const base = this.baseTerrain!;
+    this.model = buildModelInputs(base, this.scenario!, this.aux);
+    this.terrain = { ...base, z: this.model.bed };
+    this.dynT = NaN;
+  }
+
+  private buildLayers(resetCamera: boolean): void {
+    const t = this.terrain!;
     let zMin = Infinity;
     let zMax = -Infinity;
     for (let k = 0; k < t.z.length; k++) {
@@ -176,38 +224,158 @@ export class App {
     this.terrainLayer.build(t, frame, index, this.viewer.geo);
     this.terrainLayer.setLab(this.presetGroup === '基准验证');
     this.terrainLayer.setContours(this.view.contours, this.view.contourInterval);
-    this.terrainLayer.setTexture(null);
-    this.basemapCanvas = null;
     this.waterLayer.build(t, frame, index, this.viewer.geo);
-    this.viewer.setFrame(frame);
+    this.viewer.setFrame(frame, resetCamera);
     this.particles.setFrame(frame, t.z);
     this.particles.setCount(this.view.particles ? this.view.particleCount : 0);
     this.particles.speedFactor = this.view.particleSpeed;
     this.particles.showDepth = this.view.showDepth;
     this.markers.setTerrain(t);
+  }
+
+  private resetResults(): void {
     this.current = null;
     this.envelopes = null;
     this.stats = null;
     this.series.clear();
     this.frames.clear();
     this.playbackIndex = null;
-    this.selected = null;
-    this.draft = [];
     this.finished = false;
     this.running = false;
-    const L = Math.max(t.nx * t.dx, t.ny * t.dy);
-    this.pourRate = +Math.max(0.1, (L * L * 3e-4) / 60).toPrecision(2);
-    this.attribution = [];
-    if (t.attribution) this.attribution.push(t.attribution);
+  }
+
+  /** Terrain-changing edits (buildings, structure lines, DEM processing): rebuild views and restart. */
+  private rebuildBed(): void {
+    this.pauseIfRunning();
+    this.computeModel();
+    this.buildLayers(false);
+    this.resetResults();
     this.initWorker();
     this.refreshMarkers();
+    this.updateOverlay();
     this.applyStyle(true);
-    if (this.view.basemap !== 'none') void this.loadBasemapTexture(this.view.basemap);
     this.emit('case');
-    this.emit('scenario');
-    this.emit('view');
     this.emit('simstate');
     this.emit('playback');
+  }
+
+  /** Import buildings and/or land cover from OpenStreetMap vector tiles for the current (geo-referenced) terrain. */
+  async importOsm(what: { buildings: boolean; landcover: boolean }): Promise<void> {
+    const base = this.baseTerrain;
+    const sc = this.scenario;
+    if (!base || !sc) return;
+    if (base.georef.kind !== 'mercator') {
+      this.toast('OpenStreetMap 导入需要地理坐标地形（在线 DEM 或真实地形算例）', 'info');
+      return;
+    }
+    this.setBusy('准备下载 OpenStreetMap 数据…', 0);
+    try {
+      const r = await importOsmVector(base.georef, base, { ...what, onProgress: (m, fr) => this.setBusy(m, fr) });
+      if (this.baseTerrain !== base) return;
+      if (what.landcover) this.aux.landcover = r.landcover;
+      if (what.buildings) this.aux.buildings = r.buildings;
+      this.updateAttribution();
+      const n = base.nx * base.ny;
+      const parts: string[] = [];
+      if (r.landcover) {
+        const covered = n - (r.classCells.none ?? 0);
+        parts.push(`土地覆盖 ${((100 * covered) / n).toFixed(0)}% 网格有分类`);
+      }
+      if (r.buildings) parts.push(`建筑物 ${r.buildings.count.toLocaleString()} 栋`);
+      if (what.buildings && sc.buildings!.mode === 'block') this.rebuildBed();
+      else this.update('roughness', () => undefined);
+      const coarse = what.buildings && sc.buildings!.mode === 'block' && Math.max(base.dx, base.dy) > 15;
+      this.toast(
+        `已导入 OpenStreetMap（${r.tiles} 个 z${r.zoom} 矢量瓦片）：${parts.join('，')}` +
+          (coarse ? `。网格 ${base.dx.toFixed(0)} m 较粗，建议在"③ 建筑物与水工结构"中改用"高糙率"处理建筑物` : ''),
+        'ok',
+      );
+    } catch (err) {
+      this.toast(`OpenStreetMap 导入失败：${(err as Error).message}`, 'error');
+    } finally {
+      this.setBusy(null);
+    }
+  }
+
+  /** Terrain overlay texture: roughness, land-cover classes or building coverage. */
+  updateOverlay(): void {
+    const t = this.terrain;
+    const m = this.model;
+    const sc = this.scenario;
+    if (!t || !m || !sc) return;
+    const mode = this.view.terrainOverlay;
+    if (mode === 'none') {
+      this.terrainLayer.setOverlay(null, 0);
+      return;
+    }
+    const n = t.nx * t.ny;
+    const rgba = new Uint8Array(4 * n);
+    const hex = (h: string): [number, number, number] => {
+      const v = parseInt(h.slice(1), 16);
+      return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+    };
+    if (mode === 'roughness') {
+      const lo = Math.log(ROUGH_RANGE[0]);
+      const hi = Math.log(ROUGH_RANGE[1]);
+      for (let c = 0; c < n; c++) {
+        const v = m.manning ? m.manning[c] : sc.manning;
+        const [r, g, b] = roughColor((Math.log(Math.max(1e-4, v)) - lo) / (hi - lo));
+        rgba[4 * c] = r;
+        rgba[4 * c + 1] = g;
+        rgba[4 * c + 2] = b;
+        rgba[4 * c + 3] = 235;
+      }
+    } else if (mode === 'landcover') {
+      const lc = this.aux.landcover;
+      const cols = LANDCOVER_CLASSES.map((k) => hex(k.color));
+      if (lc) {
+        for (let c = 0; c < n; c++) {
+          const k = lc.cls[c];
+          if (k > 0) {
+            rgba[4 * c] = cols[k][0];
+            rgba[4 * c + 1] = cols[k][1];
+            rgba[4 * c + 2] = cols[k][2];
+            rgba[4 * c + 3] = 230;
+          }
+        }
+      }
+    } else if (mode === 'buildings') {
+      const cov = m.buildingCover;
+      if (cov) {
+        for (let c = 0; c < n; c++) {
+          if (cov[c] > 0) {
+            rgba[4 * c] = 200;
+            rgba[4 * c + 1] = 70;
+            rgba[4 * c + 2] = 60;
+            rgba[4 * c + 3] = Math.round((255 * cov[c]) / 16);
+          }
+        }
+      }
+    }
+    this.terrainLayer.setOverlay({ data: rgba, nx: t.nx, ny: t.ny }, 1);
+  }
+
+  /** Show gates / breaches at the displayed time by moving the affected terrain and water vertices. */
+  private syncDynamicBed(time: number): void {
+    const m = this.model;
+    const tr = this.terrain;
+    if (!m || !tr || !m.lines.length || time === this.dynT) return;
+    this.dynT = time;
+    let changed = false;
+    for (const L of m.lines) {
+      const crest = sampleSeries(L.series, time);
+      L.cells.forEach((c, k) => {
+        const zb = Math.fround(lineBed(L.mode, L.zGround[k], crest));
+        if (tr.z[c] !== zb) {
+          tr.z[c] = zb;
+          changed = true;
+        }
+      });
+    }
+    if (changed) {
+      this.terrainLayer.setHeights(tr.z);
+      this.waterLayer.setHeights(tr.z);
+    }
   }
 
   async loadBasemapTexture(kind: ViewSettings['basemap']): Promise<void> {
@@ -247,6 +415,7 @@ export class App {
     this.attribution = [];
     if (t?.attribution) this.attribution.push(t.attribution);
     if (this.basemapCanvas && this.view.basemap !== 'none') this.attribution.push(BASEMAPS[this.view.basemap].attribution);
+    if (this.aux.buildings || this.aux.landcover) this.attribution.push(OSM_VECTOR_ATTRIBUTION);
     if (this.scenario?.rainfall.origin?.includes('Open-Meteo') || this.scenario?.sources.some((s) => s.origin?.includes('Open-Meteo')))
       this.attribution.push('气象/水文：Open-Meteo.com（ERA5 · Copernicus GloFAS），CC BY 4.0');
   }
@@ -266,9 +435,9 @@ export class App {
       rainfall: s.rainfall.enabled ? { ...s.rainfall } : null,
       velocityCap: 25,
       arrivalDepth: s.simulation.arrivalDepth,
-      manningField: null,
-      lines: [],
-      links: [],
+      manningField: this.model?.manning ?? null,
+      lines: this.model?.lines ?? [],
+      links: this.model?.links ?? [],
     };
   }
 
@@ -456,6 +625,14 @@ export class App {
     } else if (kind === 'observers') {
       const o = this.observerSpecs();
       this.sim.setObservers(o.probes, o.sections);
+    } else if (kind === 'roughness' || kind === 'links') {
+      // the bed does not change: refresh the Manning field / links and update the running solver
+      this.model = buildModelInputs(this.baseTerrain!, s, this.aux);
+      this.sim.setParams(kind === 'roughness' ? { manning: s.manning, manningField: this.model.manning } : { links: this.model.links });
+      this.updateOverlay();
+    } else if (kind === 'bed') {
+      this.rebuildBed();
+      this.toast('地形/结构已更新，模拟已从初始状态重新开始', 'info');
     } else if (kind === 'settings') {
       this.sim.setParams(this.solverParams(), {
         duration: s.simulation.duration,
@@ -501,6 +678,7 @@ export class App {
       if (info.envelope) this.sim.requestEnvelopes();
     }
     if (patch.basemap !== undefined && patch.basemap !== prev.basemap) void this.loadBasemapTexture(v.basemap);
+    if (patch.terrainOverlay !== undefined && patch.terrainOverlay !== prev.terrainOverlay) this.updateOverlay();
     this.applyStyle(true);
     this.emit('view');
   }
@@ -529,6 +707,7 @@ export class App {
     const mode = this.view.colorMode;
     const info = COLOR_MODES[mode];
     const n = t.nx * t.ny;
+    this.syncDynamicBed(this.displayed()?.t ?? this.stats?.t ?? 0);
     if (info.envelope) {
       const e = this.envelopes;
       if (!e) {
@@ -625,6 +804,20 @@ export class App {
     this.emit('tool');
   }
 
+  /** Kind of structure line drawn by the 'structure' tool (activates the tool). */
+  setStructureKind(kind: StructureKind, activate = true): void {
+    this.structureKind = kind;
+    if (activate && this.tool !== 'structure') this.setTool('structure');
+    else this.emit('tool');
+  }
+
+  /** Kind of link placed by the 'link' tool (activates the tool). */
+  setLinkKind(kind: LinkKind, activate = true): void {
+    this.linkKind = kind;
+    if (activate && this.tool !== 'link') this.setTool('link');
+    else this.emit('tool');
+  }
+
   private pick(ev: { clientX: number; clientY: number }): { x: number; y: number; elev: number } | null {
     if (!this.terrain) return null;
     const s = this.displayed();
@@ -664,7 +857,7 @@ export class App {
       if (e.target === canvas && moved < 5 && quick && e.button === 0) this.onClick(e);
     });
     canvas.addEventListener('dblclick', () => {
-      if (this.tool === 'region') this.finishRegion();
+      if (DRAFT_TOOLS.includes(this.tool)) this.finishDraft();
     });
     canvas.addEventListener('pointermove', (e) => {
       if (!hoverQueued) requestAnimationFrame(() => {
@@ -682,7 +875,7 @@ export class App {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (e.key === 'Escape') this.setTool('navigate');
-      if (e.key === 'Enter' && this.tool === 'region') this.finishRegion();
+      if (e.key === 'Enter' && DRAFT_TOOLS.includes(this.tool)) this.finishDraft();
       if (e.key === ' ') {
         e.preventDefault();
         this.toggleRun();
@@ -720,8 +913,8 @@ export class App {
     } else if (this.tool === 'source') {
       this.markers.setCursor(p.x, p.y, 2 * Math.max(t.dx, t.dy));
     } else this.markers.setCursor(null);
-    if ((this.tool === 'region' || this.tool === 'section') && this.draft.length) {
-      this.markers.setDraft(this.draft, this.tool === 'region', [p.x, p.y]);
+    if ((DRAFT_TOOLS.includes(this.tool) || this.tool === 'section' || this.tool === 'link') && this.draft.length) {
+      this.markers.setDraft(this.draft, this.isPolygonTool(), [p.x, p.y]);
     }
     this.emit('hover');
   }
@@ -766,12 +959,110 @@ export class App {
         break;
       }
       case 'region':
+      case 'roughZone':
+      case 'building':
+      case 'structure':
         this.draft.push([p.x, p.y]);
-        this.markers.setDraft(this.draft, true);
+        this.markers.setDraft(this.draft, this.isPolygonTool());
         break;
+      case 'link': {
+        this.draft.push([p.x, p.y]);
+        if (this.draft.length === 2) {
+          const [[x1, y1], [x2, y2]] = this.draft;
+          this.draft = [];
+          this.markers.setDraft([], false);
+          this.addLink(x1, y1, x2, y2);
+        } else this.markers.setDraft(this.draft, false);
+        break;
+      }
       default:
         break;
     }
+  }
+
+  private isPolygonTool(): boolean {
+    return this.tool === 'region' || this.tool === 'roughZone' || this.tool === 'building';
+  }
+
+  /** Bed (effective) elevation at a point. */
+  private bedAt(x: number, y: number): number {
+    const t = this.terrain!;
+    const i = Math.min(t.nx - 1, Math.max(0, Math.floor(x / t.dx)));
+    const j = Math.min(t.ny - 1, Math.max(0, Math.floor(y / t.dy)));
+    return t.z[j * t.nx + i];
+  }
+
+  /** Finish the polygon / polyline being drawn with the current tool. */
+  finishDraft(): void {
+    if (this.tool === 'region') return this.finishRegion();
+    const t = this.terrain;
+    const s = this.scenario;
+    if (!t || !s) return;
+    const pts = this.draft.slice();
+    const need = this.tool === 'structure' ? 2 : 3;
+    if (pts.length < need) {
+      if (pts.length) this.toast(this.tool === 'structure' ? '结构线至少需要 2 个点' : '多边形至少需要 3 个顶点', 'info');
+      return;
+    }
+    this.draft = [];
+    this.markers.setDraft([], false);
+    if (this.tool === 'roughZone') {
+      const id = uid('z');
+      const n = s.roughness!.zones.length + 1;
+      this.update('roughness', (sc) => sc.roughness!.zones.push({ id, name: `糙率分区 ${n}`, polygon: pts, n: 0.1 }));
+      this.select(id);
+      this.toast(`已添加糙率分区 ${n}（n = 0.1，可在"② 糙率与土地利用"中修改）`, 'ok');
+    } else if (this.tool === 'building') {
+      const id = uid('b');
+      // resistance mode only changes roughness; block mode (or switching on from 'off') changes the bed
+      const kind: ChangeKind = s.buildings!.mode === 'resistance' ? 'roughness' : 'bed';
+      this.update(kind, (sc) => {
+        if (sc.buildings!.mode === 'off') sc.buildings!.mode = 'block';
+        sc.buildings!.items.push({ id, polygon: pts, height: sc.buildings!.defaultHeight });
+      });
+      this.toast(`已添加建筑物（高 ${s.buildings!.defaultHeight} m，${s.buildings!.mode === 'block' ? '阻水块' : '高糙率'}）`, 'ok');
+    } else if (this.tool === 'structure') {
+      const kind = this.structureKind;
+      const zs: number[] = [];
+      const step = Math.min(t.dx, t.dy);
+      for (let k = 0; k + 1 < pts.length; k++) {
+        const [x1, y1] = pts[k];
+        const [x2, y2] = pts[k + 1];
+        const m = Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1) / step));
+        for (let q = 0; q <= m; q++) zs.push(this.bedAt(x1 + ((x2 - x1) * q) / m, y1 + ((y2 - y1) * q) / m));
+      }
+      const zMaxL = Math.max(...zs);
+      const zMinL = Math.min(...zs);
+      const r1 = (v: number): number => Math.round(v * 10) / 10;
+      const id = uid('w');
+      const names = { levee: '堤防', weir: '堰', gate: '闸门', breach: '溃口' };
+      const n = s.structures!.filter((x) => x.kind === kind).length + 1;
+      const base = { id, name: `${names[kind]} ${n}`, kind, points: pts, width: 0 };
+      const dur = s.simulation.duration;
+      const item =
+        kind === 'levee'
+          ? { ...base, crest: r1(zMaxL + 1) }
+          : kind === 'weir'
+            ? { ...base, crest: r1(zMinL + 0.5) }
+            : kind === 'gate'
+              ? { ...base, crest: r1(zMaxL + 0.5), bottom: r1(zMinL), t1: Math.round(dur * 0.3), t2: 0, ramp: 60 }
+              : { ...base, crest: r1(zMaxL), bottom: r1(zMinL), t1: Math.round(dur * 0.2), ramp: Math.round(Math.min(1800, dur * 0.1)) };
+      this.update('bed', (sc) => sc.structures!.push(item));
+      this.select(id);
+      this.toast(`已添加${names[kind]}（顶高 ${item.crest} m，可在"③ 建筑物与水工结构"中修改）`, 'ok');
+    }
+  }
+
+  private addLink(x1: number, y1: number, x2: number, y2: number): void {
+    const s = this.scenario!;
+    const kind = this.linkKind;
+    const id = uid('l');
+    const n = s.links!.filter((l) => l.kind === kind).length + 1;
+    const name = kind === 'culvert' ? `涵洞 ${n}` : `泵站 ${n}`;
+    const Q = +Math.max(0.5, this.pourRate * 0.2).toPrecision(2);
+    this.update('links', (sc) => sc.links!.push({ id, name, kind, x1, y1, x2, y2, diameter: 1, count: 1, cd: 0.6, series: [[0, Q]] }));
+    this.select(id);
+    this.toast(kind === 'culvert' ? `已添加${name}（直径 1 m，按孔口公式双向过流）` : `已添加${name}（${Q} m³/s，从起点抽至终点）`, 'ok');
   }
 
   finishRegion(): void {
@@ -803,7 +1094,7 @@ export class App {
   // ---------------------------------------------------------------- terrain processing
   /** Priority-Flood depression filling seeded from non-wall boundaries; reloads the case with the new bed. */
   fillTerrain(maxDepth: number): void {
-    const t = this.terrain;
+    const t = this.baseTerrain;
     const s = this.scenario;
     if (!t || !s) return;
     const B = s.boundaries;
@@ -813,8 +1104,8 @@ export class App {
       this.toast('未发现需要填充的洼地', 'info');
       return;
     }
-    const terrain: Terrain = { ...t, z: r.z, name: t.name.includes('已填洼') ? t.name : `${t.name}（已填洼）` };
-    this.loadCase({ terrain, scenario: s, initialDepth: this.initialOverride ?? undefined }, true);
+    this.baseTerrain = { ...t, z: r.z, name: t.name.includes('已填洼') ? t.name : `${t.name}（已填洼）` };
+    this.rebuildBed();
     this.toast(
       `填洼完成：抬高 ${r.filledCells} 个网格，最大 ${r.maxFill.toFixed(2)} m，填充体积 ${(r.volume / 1e6).toFixed(3)} 百万 m³（模拟已重置）`,
       'ok',
@@ -834,4 +1125,28 @@ export function niceCeil(x: number): number {
   const m = x / p;
   const n = m <= 1 ? 1 : m <= 1.5 ? 1.5 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 3 ? 3 : m <= 4 ? 4 : m <= 5 ? 5 : m <= 6 ? 6 : m <= 8 ? 8 : 10;
   return n * p;
+}
+
+/** Manning n range of the roughness overlay (log scale). */
+export const ROUGH_RANGE: [number, number] = [0.01, 0.3];
+
+/** Colour ramp for Manning n (log scale, smooth -> rough). */
+export function roughColor(t: number): [number, number, number] {
+  const stops: [number, [number, number, number]][] = [
+    [0, [49, 130, 189]],
+    [0.3, [102, 194, 164]],
+    [0.55, [230, 220, 110]],
+    [0.8, [216, 120, 50]],
+    [1, [140, 40, 40]],
+  ];
+  t = Math.min(1, Math.max(0, t));
+  for (let k = 0; k < stops.length - 1; k++) {
+    const [t0, c0] = stops[k];
+    const [t1, c1] = stops[k + 1];
+    if (t <= t1) {
+      const f = (t - t0) / (t1 - t0);
+      return [Math.round(c0[0] + (c1[0] - c0[0]) * f), Math.round(c0[1] + (c1[1] - c0[1]) * f), Math.round(c0[2] + (c1[2] - c0[2]) * f)];
+    }
+  }
+  return stops[stops.length - 1][1];
 }

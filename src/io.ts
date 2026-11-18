@@ -136,35 +136,57 @@ function f32ToB64(a: Float32Array): string {
   return btoa(s);
 }
 
-function b64ToF32(b64: string): Float32Array {
+function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
-  return new Float32Array(bytes.buffer);
+  return bytes;
+}
+
+function b64ToF32(b64: string): Float32Array {
+  return new Float32Array(b64ToBytes(b64).buffer);
+}
+
+function u8ToB64(a: Uint8Array): string {
+  return f32ToB64(new Float32Array(a.buffer.slice(a.byteOffset, a.byteOffset + Math.ceil(a.byteLength / 4) * 4)));
 }
 
 interface ProjectFile {
   format: 'hydrosim-web-project';
-  version: 1;
+  version: 1 | 2;
   presetId: string | null;
   presetGroup: string | null;
   scenario: Scenario;
   view: ViewSettings;
+  /** Raw DEM (structures and buildings are re-applied from the scenario). */
   terrain: Omit<Terrain, 'z'> & { z: string };
+  /** OpenStreetMap rasters (v2). */
+  buildings?: { cover: string; height: string; count: number; source: string } | null;
+  landcover?: { cls: string; source: string } | null;
 }
 
 export function saveProject(app: App): void {
-  const t = app.terrain;
+  const t = app.baseTerrain;
   const s = app.scenario;
   if (!t || !s) return;
+  const n = t.nx * t.ny;
+  const pad4 = (a: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(Math.ceil(n / 4) * 4);
+    out.set(a);
+    return out;
+  };
+  const b = app.aux.buildings;
+  const lc = app.aux.landcover;
   const p: ProjectFile = {
     format: 'hydrosim-web-project',
-    version: 1,
+    version: 2,
     presetId: app.presetId,
     presetGroup: app.presetGroup,
     scenario: s,
     view: app.view,
     terrain: { ...t, z: f32ToB64(t.z) },
+    buildings: b ? { cover: u8ToB64(pad4(b.cover)), height: f32ToB64(b.height), count: b.count, source: b.source } : null,
+    landcover: lc ? { cls: u8ToB64(pad4(lc.cls)), source: lc.source } : null,
   };
   download(`${baseName(app)}_${stamp()}.hydrosim.json`, JSON.stringify(p), 'application/json');
 }
@@ -173,10 +195,21 @@ export async function openProject(app: App, file: File): Promise<void> {
   const p = JSON.parse(await file.text()) as ProjectFile;
   if (p.format !== 'hydrosim-web-project') throw new Error('不是 HydroSim Web 工程文件');
   const terrain: Terrain = { ...p.terrain, z: b64ToF32(p.terrain.z) };
+  const n = terrain.nx * terrain.ny;
   app.presetId = p.presetId;
   app.presetGroup = p.presetGroup;
   app.view = { ...app.view, ...p.view };
-  app.loadCase({ terrain, scenario: p.scenario }, true);
+  app.loadCase(
+    {
+      terrain,
+      scenario: p.scenario,
+      buildings: p.buildings
+        ? { cover: b64ToBytes(p.buildings.cover).slice(0, n), height: b64ToF32(p.buildings.height), count: p.buildings.count, source: p.buildings.source }
+        : null,
+      landcover: p.landcover ? { cls: b64ToBytes(p.landcover.cls).slice(0, n), source: p.landcover.source } : null,
+    },
+    true,
+  );
 }
 
 export async function importAsc(app: App, file: File, maxCells: number): Promise<void> {

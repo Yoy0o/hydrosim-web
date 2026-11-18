@@ -1,7 +1,7 @@
-/** Left panel: model setup tree (terrain, roughness, boundaries, initial conditions, sources, numerics, observers). */
-import type { App, Tool } from '../app';
+/** Left panel: model setup tree (terrain, roughness, structures, boundaries, initial conditions, sources, numerics, observers). */
+import type { App } from '../app';
 import type { BoundarySpec, Side } from '../core/solver';
-import { integrateSeries, parseSeriesText, seriesMax, seriesToText, triangularHydrograph, type TimeSeries } from '../core/timeseries';
+import { integrateSeries, seriesMax, triangularHydrograph, type TimeSeries } from '../core/timeseries';
 import { cosLatOf, localToLonLat } from '../data/geo';
 import { dischargeSeriesFromDaily, fetchDailyDischarge, fetchHourlyRain, rainSeriesFromHourly } from '../data/openmeteo';
 import type { Scenario, SourceDef } from '../types';
@@ -9,6 +9,10 @@ import type { EnginePref } from '../worker/protocol';
 import { button, checkRow, el, fmt, fmtVolume, icon, numInput, numRow, row, select, selectRow } from './dom';
 import { ICONS } from './icons';
 import { openMapPicker } from './mapPicker';
+import { section, seriesEditor, timeUnit, toolBtn } from './panelKit';
+import { roughnessSection, structuresSection } from './structuresPanel';
+
+export { timeUnit };
 
 const SIDE_LABEL: Record<Side, string> = { west: '西边界 (W)', east: '东边界 (E)', south: '南边界 (S)', north: '北边界 (N)' };
 const BC_TYPES: [BoundarySpec['type'], string][] = [
@@ -17,48 +21,6 @@ const BC_TYPES: [BoundarySpec['type'], string][] = [
   ['level', '水位过程'],
   ['tide', '正弦潮位'],
 ];
-
-/** Time unit used for editing series, based on the simulated duration. */
-export function timeUnit(duration: number): { f: number; label: string } {
-  if (duration >= 3 * 3600) return { f: 3600, label: 'h' };
-  if (duration >= 180) return { f: 60, label: 'min' };
-  return { f: 1, label: 's' };
-}
-
-function section(id: string, title: string, open: Set<string>, rerender: () => void, badge: string | null, ...content: (HTMLElement | null)[]): HTMLElement {
-  const isOpen = open.has(id);
-  const head = el(
-    'button',
-    {
-      class: `sec-head ${isOpen ? 'open' : ''}`,
-      type: 'button',
-      onclick: () => {
-        if (open.has(id)) open.delete(id);
-        else open.add(id);
-        rerender();
-      },
-    },
-    icon(ICONS.chevron, 14),
-    el('span', { class: 'sec-title' }, title),
-    badge ? el('span', { class: 'badge' }, badge) : null,
-  );
-  return el('div', { class: 'sec' }, head, isOpen ? el('div', { class: 'sec-body' }, ...content) : null);
-}
-
-function seriesEditor(series: TimeSeries, unit: { f: number; label: string }, valueLabel: string, onChange: (s: TimeSeries) => void, rows = 5): HTMLElement {
-  const ta = el('textarea', { class: 'series', rows, spellcheck: false }) as HTMLTextAreaElement;
-  ta.value = seriesToText(series, unit.f, 4);
-  ta.addEventListener('change', () => {
-    const s = parseSeriesText(ta.value, unit.f);
-    if (s.length) onChange(s);
-  });
-  return el('div', { class: 'series-box' }, el('div', { class: 'series-head' }, `时间 (${unit.label}), ${valueLabel}`), ta);
-}
-
-function toolBtn(app: App, tool: Tool, label: string, ic: string): HTMLButtonElement {
-  const b = button(el('span', null, icon(ic, 15), ` ${label}`), () => app.setTool(app.tool === tool ? 'navigate' : tool), `btn small ${app.tool === tool ? 'active' : ''}`);
-  return b;
-}
 
 function isoDay(offsetDays: number): string {
   return new Date(Date.now() + offsetDays * 86400000).toISOString().slice(0, 10);
@@ -118,26 +80,9 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       fillTool(app),
     );
 
-    // ---------------------------------------------------------------- roughness
-    const roughSec = section(
-      'rough',
-      '② 糙率',
-      open,
-      render,
-      `n=${s.manning}`,
-      numRow('曼宁系数 n', s.manning, (v) => app.update('params', (sc) => (sc.manning = v)), { min: 0, max: 0.5, step: 0.001, unit: 's/m^⅓' }),
-      el(
-        'div',
-        { class: 'hint-table' },
-        ...[
-          ['混凝土/光滑渠道', '0.012–0.015'],
-          ['顺直天然河道', '0.025–0.035'],
-          ['蜿蜒多草河道', '0.035–0.05'],
-          ['草地/农田', '0.03–0.05'],
-          ['城镇/林地', '0.06–0.15'],
-        ].map(([a, b]) => el('div', null, el('span', null, a), el('b', null, b))),
-      ),
-    );
+    // ---------------------------------------------------------------- roughness, buildings, structures
+    const roughSec = roughnessSection(app, open, render);
+    const structSec = structuresSection(app, open, render);
 
     // ---------------------------------------------------------------- boundaries
     const bcRows: HTMLElement[] = [];
@@ -165,7 +110,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       }
       bcRows.push(box);
     }
-    const bcSec = section('bc', '③ 边界条件', open, render, null, ...bcRows);
+    const bcSec = section('bc', '④ 边界条件', open, render, null, ...bcRows);
 
     // ---------------------------------------------------------------- initial conditions
     const ic = s.initial;
@@ -190,7 +135,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
     const baseOn = ic.baseLevel !== null;
     const icSec = section(
       'ic',
-      '④ 初始条件',
+      '⑤ 初始条件',
       open,
       render,
       ic.regions.length ? `${ic.regions.length} 水体` : null,
@@ -233,7 +178,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
     );
     const srcSec = section(
       'src',
-      '⑤ 源汇项（入流 / 降雨）',
+      '⑥ 源汇项（入流 / 降雨）',
       open,
       render,
       `${s.sources.length} 入流${rf.enabled ? ' · 降雨' : ''}`,
@@ -250,7 +195,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
     const durUnit = timeUnit(sim.duration);
     const simSec = section(
       'sim',
-      '⑥ 计算设置',
+      '⑦ 计算设置',
       open,
       render,
       `${sim.order === 2 ? '二阶' : '一阶'} · ${app.engineInfo ? (app.engineInfo.kind === 'gpu' ? 'GPU' : 'CPU') : '…'}`,
@@ -328,7 +273,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
     );
     const obsSec = section(
       'obs',
-      '⑦ 观测点与断面',
+      '⑧ 观测点与断面',
       open,
       render,
       `${s.probes.length} 点 · ${s.sections.length} 断面`,
@@ -344,6 +289,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       caseSec,
       terrainSec,
       roughSec,
+      structSec,
       bcSec,
       icSec,
       srcSec,

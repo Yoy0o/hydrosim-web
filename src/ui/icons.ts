@@ -28,4 +28,9 @@ export const ICONS = {
   layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/>',
   rain: '<path d="M7 15a4.5 4.5 0 0 1 .5-9 6 6 0 0 1 11 2.5A3.5 3.5 0 0 1 18 15z"/><path d="M8 18l-1 3M12 18l-1 3M16 18l-1 3"/>',
   live: '<circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M6.3 6.3a8 8 0 0 0 0 11.4M17.7 6.3a8 8 0 0 1 0 11.4"/>',
+  rough: '<path d="M4 7l6-4 10 5-3 11H6z" stroke-dasharray="3 2"/><path d="M7 16l7-7M9 18.5l8.5-8.5M6 12l5-5"/>',
+  building: '<path d="M3 21h18"/><path d="M5 21V10l5-3v14"/><path d="M10 21V4l9 3v14"/><path d="M13 9h3M13 12.5h3M13 16h3"/>',
+  levee: '<path d="M2 19h4l4.5-9h3L18 19h4"/><path d="M2 14.5c1.3 0 1.3-1 2.6-1s1.3 1 2.6 1"/><path d="M10.5 10h3"/>',
+  link: '<path d="M4 8h4a4 4 0 0 1 4 4 4 4 0 0 0 4 4h4"/><circle cx="4" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M11 6.5l2 1.5-2 1.5"/>',
+  osm: '<path d="M3 6l6-2.5 6 2.5 6-2.5v14.5L15 20.5 9 18l-6 2.5z"/><path d="M9 3.5V18M15 6v14.5"/>',
 };
