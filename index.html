@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="HydroSim Web — 基于 Three.js 与 Web Worker 的二维浅水方程水动力仿真平台（MVP）" />
+    <title>HydroSim Web · 二维水动力仿真</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2322d3ee' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M2 15c2.5 0 2.5-2 5-2s2.5 2 5 2 2.5-2 5-2 2.5 2 5 2'/%3E%3Cpath d='M12 3c-2 3-4 5.2-4 7.2a4 4 0 0 0 8 0C16 8.2 14 6 12 3z'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar"></header>
+      <div id="main">
+        <aside id="left" class="panel"></aside>
+        <section id="center">
+          <div id="viewport"></div>
+          <div id="dock"></div>
+        </section>
+        <aside id="right" class="panel"></aside>
+      </div>
+      <footer id="statusbar"></footer>
+    </div>
+    <div id="boot">
+      <div class="boot-card">
+        <div class="spinner"></div>
+        <div>HydroSim Web 正在启动…</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
