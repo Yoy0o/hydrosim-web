@@ -1,0 +1,29 @@
+{
+  "name": "hydrosim-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HydroSim Web - browser-based 2D shallow water hydrodynamic simulator (Three.js + Web Worker)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "fetch-dem": "node scripts/fetch-dem.mjs"
+  },
+  "dependencies": {
+    "leaflet": "^1.9.4",
+    "three": "^0.187.0",
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.22",
+    "@types/three": "^0.187.0",
+    "@webgpu/types": "^0.1.74",
+    "pngjs": "^7.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}
