@@ -18,10 +18,10 @@ struct Params {
   dx: f32, dy: f32, g: f32, cfl: f32,
   maxDt: f32, hDry: f32, n2g: f32, vcap: f32,
   arrDepth: f32, tBase: f32, tStopRel: f32, recInterval: f32,
-  infRate: f32, rainOn: u32, cellArea: f32, pad0: u32,
+  infRate: f32, rainOn: u32, cellArea: f32, nLinks: u32,
   bcType: vec4<u32>,
   stepsInBatch: u32, nProbes: u32, nSections: u32, recFloats: u32,
-  nSources: u32, forceLast: u32, statsGroups: u32, pad1: u32,
+  nSources: u32, forceLast: u32, statsGroups: u32, nLines: u32,
 }
 
 struct Ctrl {
@@ -43,12 +43,17 @@ struct Ctrl {
   pad1: f32,
   levels: vec4<f32>,
   srcVol: array<f32, 64>,
+  linkVol: array<f32, 16>,
+  lineCrest: array<f32, 16>,
 }
 `;
 
 /** Byte size / offsets of Ctrl (must match the WGSL struct). */
-export const CTRL_BYTES = 336;
+export const CTRL_BYTES = 464;
 export const CTRL_LEVELS_OFFSET = 64;
+export const CTRL_LINECREST_OFFSET = 400;
+export const MAX_LINKS = 16;
+export const MAX_LINES = 16;
 export const PARAMS_BYTES = 144;
 export const MAX_SOURCES = 64;
 export const REC_HEADER = 16;
@@ -315,6 +320,8 @@ ${COMMON}
 @group(0) @binding(2) var<storage, read> SER: array<f32>;
 @group(0) @binding(3) var<storage, read_write> DTH: array<f32>;
 @group(0) @binding(4) var<storage, read_write> IND: array<u32>;
+@group(0) @binding(5) var<storage, read> U: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> SRCP: array<vec4<f32>>;
 
 fn refOff(r: u32) -> u32 { return u32(SER[1u + 4u * r]); }
 fn refN(r: u32) -> u32 { return u32(SER[2u + 4u * r]); }
@@ -418,6 +425,31 @@ fn main() {
     inflow = inflow + v;
   }
   C.inflowAcc = C.inflowAcc + inflow;
+  // culverts (orifice, start-of-step heads) and pumps (series); at most 90 % of the source cell's water
+  for (var k = 0u; k < P.nLinks; k = k + 1u) {
+    let la = SRCP[2u * P.nSources + 2u * k];
+    let lb = SRCP[2u * P.nSources + 2u * k + 1u];
+    let ua = U[u32(la.z)];
+    let ub = U[u32(la.w)];
+    var v = 0.0;
+    if (dt > 0.0) {
+      if (lb.x > 0.5) {
+        v = max(0.0, integrateRef(5u + P.nSources + k, t0, t1));
+      } else {
+        let dH = (ua.w + ua.x) - (ub.w + ub.x);
+        var Q = 0.0;
+        if (dH > 0.0 && ua.x > P.hDry) { Q = lb.z * lb.y * sqrt(2.0 * P.g * dH); }
+        else if (dH < 0.0 && ub.x > P.hDry) { Q = -lb.z * lb.y * sqrt(-2.0 * P.g * dH); }
+        v = Q * dt;
+      }
+      if (v > 0.0) { v = min(v, 0.9 * ua.x * P.cellArea); } else if (v < 0.0) { v = max(v, -0.9 * ub.x * P.cellArea); }
+    }
+    C.linkVol[k] = v;
+  }
+  // gate / breach crests at the end of the step (applied by the zline kernel at the next step start)
+  for (var l = 0u; l < P.nLines; l = l + 1u) {
+    C.lineCrest[l] = sampleRef(5u + P.nSources + P.nLinks + l, t1);
+  }
   var lv = C.levels;
   for (var sd = 0u; sd < 4u; sd = sd + 1u) {
     if (P.bcType[sd] == 2u) { lv[sd] = sampleRef(1u + sd, t1); }
@@ -505,6 +537,7 @@ override STAGE: u32 = 0u;
 @group(0) @binding(6) var<storage, read_write> ENV: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> ACC: array<vec2<f32>>;
 @group(0) @binding(8) var<storage, read> SRCP: array<vec4<f32>>;
+@group(0) @binding(9) var<storage, read> NMAN: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -573,6 +606,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (sb.y > 0.5) { inside = c == u32(sb.x); }
     if (inside) { hn = hn + C.srcVol[s] * sa.w; }
   }
+  // culverts / pumps: move the volume decided by the scalar kernel
+  for (var k = 0u; k < P.nLinks; k = k + 1u) {
+    let v = C.linkVol[k];
+    if (v == 0.0) { continue; }
+    let la = SRCP[2u * P.nSources + 2u * k];
+    let a = u32(la.x);
+    let b = u32(la.y);
+    let fromC = select(b, a, v > 0.0);
+    let toC = select(a, b, v > 0.0);
+    let dhl = abs(v) / P.cellArea;
+    if (c == fromC) {
+      if (hn > 0.0) {
+        let r = max(0.0, hn - dhl) / hn;
+        qx = qx * r; qy = qy * r;
+      }
+      hn = hn - dhl;
+    }
+    if (c == toC) { hn = hn + dhl; }
+  }
   hn = hn + C.rainDepth;
   let infD = C.infDepth;
   if (infD > 0.0 && hn > 0.0) {
@@ -588,8 +640,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   } else {
     var q = sqrt(qx * qx + qy * qy);
     if (q > 0.0) {
-      if (P.n2g > 0.0) {
-        let a = dt * P.n2g / (hn * hn * pow(hn, 1.0 / 3.0));
+      let nm = NMAN[c];
+      let n2g = P.g * nm * nm;
+      if (n2g > 0.0) {
+        let a = dt * n2g / (hn * hn * pow(hn, 1.0 / 3.0));
         let qn = 2.0 * q / (1.0 + sqrt(1.0 + 4.0 * a * q));
         let r = qn / q;
         qx = qx * r; qy = qy * r; q = qn;
@@ -779,5 +833,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   OUT[c] = u.x;
   OUT[P.nCells + c] = vel.x;
   OUT[2u * P.nCells + c] = vel.y;
+}
+`;
+
+/** Gates / breaches: bed of each line cell from its line crest (raise / lower / set). Runs at the start of a step. */
+export const ZLINE = /* wgsl */ `
+${COMMON}
+@group(0) @binding(0) var<uniform> P: Params;
+@group(0) @binding(1) var<storage, read_write> U: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> C: Ctrl;
+@group(0) @binding(3) var<storage, read> ZL: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let k = gid.x;
+  if (k >= arrayLength(&ZL)) { return; }
+  let e = ZL[k];
+  let p = u32(e.x);
+  // (P must be referenced: with layout 'auto' an unused binding is dropped and the bind group is invalid)
+  if (p >= P.N) { return; }
+  let cr = C.lineCrest[u32(e.z)];
+  var zb = cr;
+  if (e.w < 0.5) { zb = max(e.y, cr); } else if (e.w < 1.5) { zb = min(e.y, cr); }
+  var u = U[p];
+  u.w = zb;
+  U[p] = u;
 }
 `;

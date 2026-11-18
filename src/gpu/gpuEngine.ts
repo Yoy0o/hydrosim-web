@@ -7,6 +7,7 @@
  * precision to keep simulation time exact), the records and optionally the fields for rendering.
  */
 import { boundaryLevel, SIDES, type SolverParams, type SourceSpec } from '../core/solver';
+import { sampleSeries } from '../core/timeseries';
 import type { ProbeSpec, RecordRow, SectionSpec } from '../worker/protocol';
 import type { AdvanceResult, Engine, EngineInit, EngineStats, EnvelopeData, Fields } from '../worker/engine';
 import * as K from './kernels';
@@ -30,7 +31,8 @@ type PipeName =
   | 'stats'
   | 'finalize'
   | 'copyU0'
-  | 'pack';
+  | 'pack'
+  | 'zline';
 
 function flatten(s: [number, number][]): number[] {
   const out: number[] = [];
@@ -70,6 +72,10 @@ export class GpuEngine implements Engine {
   private msPerStep = 0;
   private recFloats = K.REC_HEADER;
   private nSources = 0;
+  private nLinks = 0;
+  private nLines = 0;
+  private nLineCells = 0;
+  private dirtyManning = true;
   private buf: Record<string, GPUBuffer> = {};
   private pipes = {} as Record<PipeName, GPUComputePipeline>;
   private groups = {} as Record<PipeName, GPUBindGroup>;
@@ -155,7 +161,7 @@ export class GpuEngine implements Engine {
       if (errs.length) throw new Error(`WGSL ${name}: ${errs.map((e) => `${e.lineNum}:${e.linePos} ${e.message}`).join('; ')}`);
       return dev.createComputePipelineAsync({ label: name, layout: 'auto', compute: { module, entryPoint: 'main', constants } });
     };
-    const [bc, slopes, flux1, flux2a, flux2b, scalar, bflux, bfluxH, update0, update1, update2, stats, finalize, copyU0, pack] = await Promise.all([
+    const [bc, slopes, flux1, flux2a, flux2b, scalar, bflux, bfluxH, update0, update1, update2, stats, finalize, copyU0, pack, zline] = await Promise.all([
       compile(K.BC, 'bc'),
       compile(K.SLOPES, 'slopes'),
       compile(K.FLUX, 'flux1', { ORDER: 1, TRACK: 1 }),
@@ -171,8 +177,9 @@ export class GpuEngine implements Engine {
       compile(K.FINALIZE, 'finalize'),
       compile(K.COPY_U0, 'copyU0'),
       compile(K.PACK, 'pack'),
+      compile(K.ZLINE, 'zline'),
     ]);
-    const eng = new GpuEngine(dev, label, init, { bc, slopes, flux1, flux2a, flux2b, scalar, bflux, bfluxH, update0, update1, update2, stats, finalize, copyU0, pack });
+    const eng = new GpuEngine(dev, label, init, { bc, slopes, flux1, flux2a, flux2b, scalar, bflux, bfluxH, update0, update1, update2, stats, finalize, copyU0, pack, zline });
     // a tiny warm-up batch validates pipelines and bind groups before reporting success
     await eng.advance(0, 1, false, 1);
     if (eng.lostReason) throw new Error(eng.lostReason);
@@ -225,7 +232,8 @@ export class GpuEngine implements Engine {
 
   setParams(p: Partial<SolverParams>): void {
     this.params = { ...this.params, ...p };
-    if (p.boundaries || p.sources || p.rainfall) this.dirtySeries = true;
+    if (p.boundaries || p.sources || p.rainfall || p.links || p.lines) this.dirtySeries = true;
+    if (p.manning !== undefined || p.manningField !== undefined) this.dirtyManning = true;
   }
 
   setExtraSources(s: SourceSpec[]): void {
@@ -268,8 +276,12 @@ export class GpuEngine implements Engine {
       else if (b.type === 'tide') refs.push({ data: [b.mean, b.amplitude, b.period, b.phase], mode: 2, n: 2 });
       else refs.push({ data: [], mode: 0, n: 0 });
     }
-    const sources = [...P.sources, ...this.extra].slice(0, K.MAX_SOURCES);
+    const sources = [...P.sources, ...this.extra].slice(0, K.MAX_SOURCES - K.MAX_LINKS);
     for (const s of sources) refs.push({ data: flatten(s.series), mode: 0, n: s.series.length });
+    const links = P.links.slice(0, K.MAX_LINKS);
+    for (const L of links) refs.push(L.kind === 'pump' ? { data: flatten(L.series), mode: 0, n: L.series.length } : { data: [], mode: 0, n: 0 });
+    const lines = P.lines.slice(0, K.MAX_LINES);
+    for (const L of lines) refs.push({ data: flatten(L.series), mode: 0, n: L.series.length });
     const header = 1 + 4 * refs.length;
     const total = header + refs.reduce((a, r) => a + r.data.length, 0);
     const ser = new Float32Array(total);
@@ -285,7 +297,7 @@ export class GpuEngine implements Engine {
     this.writeBufferSized('SER', ser, BUF.S | BUF.CD);
     // source disks (same cell selection as the CPU solver)
     const { nx, ny, dx, dy } = this;
-    const sp = new Float32Array(8 * Math.max(1, sources.length));
+    const sp = new Float32Array(8 * Math.max(1, sources.length + links.length));
     sources.forEach((s, k) => {
       const r = Math.max(0, s.radius);
       let count = 0;
@@ -305,8 +317,34 @@ export class GpuEngine implements Engine {
       const area = Math.max(1, count) * dx * dy;
       sp.set([s.x, s.y, r * r, 1 / area, fj * nx + fi, count === 0 ? 1 : 0, 0, 0], 8 * k);
     });
+    const pad = (c: number): number => {
+      const i = c % nx;
+      return ((c - i) / nx + 2) * this.NX + i + 2;
+    };
+    links.forEach((L, k) => {
+      sp.set([L.a, L.b, pad(L.a), pad(L.b), L.kind === 'pump' ? 1 : 0, L.area, L.cd, 0], 8 * (sources.length + k));
+    });
     this.writeBufferSized('SRCP', sp, BUF.S | BUF.CD);
     this.nSources = sources.length;
+    this.nLinks = links.length;
+    // gate / breach cells: (padded index, ground bed, line index); exact-size buffer (arrayLength in WGSL)
+    const nLc = lines.reduce((a, L) => a + L.cells.length, 0);
+    this.nLines = lines.length;
+    this.nLineCells = nLc;
+    if (nLc > 0) {
+      const zl = new Float32Array(4 * nLc);
+      let o = 0;
+      lines.forEach((L, l) => {
+        L.cells.forEach((c, k) => {
+          zl.set([pad(c), L.zGround[k], l, L.mode === 'raise' ? 0 : L.mode === 'lower' ? 1 : 2], 4 * o);
+          o++;
+        });
+      });
+      this.buf.ZL?.destroy();
+      this.buf.ZL = this.dev.createBuffer({ label: 'ZL', size: zl.byteLength, usage: BUF.S | BUF.CD });
+      this.dev.queue.writeBuffer(this.buf.ZL, 0, zl);
+      this.dirtyGroups = true;
+    }
     this.dirtySeries = false;
   }
 
@@ -344,6 +382,20 @@ export class GpuEngine implements Engine {
     this.dirtyObs = false;
   }
 
+  /** Per-cell Manning coefficient (uniform value replicated when no field is given). */
+  private uploadManning(): void {
+    const P = this.params;
+    const n = new Float32Array(this.nCells);
+    if (P.manningField && P.manningField.length === this.nCells) n.set(P.manningField);
+    else n.fill(P.manning);
+    if (!this.buf.NMAN) {
+      this.buf.NMAN = this.dev.createBuffer({ label: 'NMAN', size: 4 * this.nCells, usage: BUF.S | BUF.CD });
+      this.dirtyGroups = true;
+    }
+    this.dev.queue.writeBuffer(this.buf.NMAN, 0, n);
+    this.dirtyManning = false;
+  }
+
   private ensureOrder2(): void {
     if (this.order2Ready) return;
     this.buf.U0 = this.dev.createBuffer({ label: 'U0', size: 16 * this.N, usage: BUF.S });
@@ -365,10 +417,11 @@ export class GpuEngine implements Engine {
     // unused bindings (MUSCL slopes in first order, U0 outside Heun stage 2) get small dummy buffers
     bind('bc', [b.P, b.U, b.C]);
     bind('flux1', [b.P, b.U, b.DUMMY, b.F, b.R, b.C]);
-    bind('scalar', [b.P, b.C, b.SER, b.DTH, b.IND]);
+    bind('scalar', [b.P, b.C, b.SER, b.DTH, b.IND, b.U, b.SRCP]);
     bind('bflux', [b.P, b.F, b.C, b.BACC]);
     bind('bfluxH', [b.P, b.F, b.C, b.BACC]);
-    bind('update0', [b.P, b.U, b.DUMMY2, b.F, b.R, b.C, b.ENV, b.ACC, b.SRCP]);
+    bind('update0', [b.P, b.U, b.DUMMY2, b.F, b.R, b.C, b.ENV, b.ACC, b.SRCP, b.NMAN]);
+    if (b.ZL) bind('zline', [b.P, b.U, b.C, b.ZL]);
     bind('stats', [b.P, b.U, b.ACC, b.PART]);
     bind('finalize', [b.P, b.U, b.C, b.PART, b.BACC, b.OBS, b.REC]);
     bind('pack', [b.P, b.U, b.PACK]);
@@ -376,8 +429,8 @@ export class GpuEngine implements Engine {
       bind('slopes', [b.P, b.U, b.SL]);
       bind('flux2a', [b.P, b.U, b.SL, b.F, b.R, b.C]);
       bind('flux2b', [b.P, b.U, b.SL, b.F, b.R, b.C]);
-      bind('update1', [b.P, b.U, b.DUMMY2, b.F, b.R, b.C, b.ENV, b.ACC, b.SRCP]);
-      bind('update2', [b.P, b.U, b.U0, b.F, b.R, b.C, b.ENV, b.ACC, b.SRCP]);
+      bind('update1', [b.P, b.U, b.DUMMY2, b.F, b.R, b.C, b.ENV, b.ACC, b.SRCP, b.NMAN]);
+      bind('update2', [b.P, b.U, b.U0, b.F, b.R, b.C, b.ENV, b.ACC, b.SRCP, b.NMAN]);
       bind('copyU0', [b.P, b.U, b.U0]);
     }
     this.dirtyGroups = false;
@@ -387,6 +440,7 @@ export class GpuEngine implements Engine {
     if (this.lostReason) throw new Error(this.lostReason);
     if (this.params.order === 2) this.ensureOrder2();
     if (this.dirtySeries) this.uploadSeries();
+    if (this.dirtyManning) this.uploadManning();
     if (this.dirtyObs) this.uploadObservers();
     if (this.dirtyGroups) this.buildGroups();
   }
@@ -434,6 +488,8 @@ export class GpuEngine implements Engine {
     u[32] = this.nSources;
     u[33] = 1;
     u[34] = this.statsGroups;
+    u[23] = this.nLinks;
+    u[35] = this.nLines;
     this.dev.queue.writeBuffer(this.buf.P, 0, ab);
     // per-batch control header (accumulators are batch-relative; the CPU keeps double-precision totals)
     const hdr = new ArrayBuffer(K.CTRL_LEVELS_OFFSET);
@@ -446,6 +502,11 @@ export class GpuEngine implements Engine {
       return Number.isFinite(v) ? v : 0;
     }));
     this.dev.queue.writeBuffer(this.buf.C, K.CTRL_LEVELS_OFFSET, lv);
+    if (this.nLines > 0) {
+      const crest = new Float32Array(this.nLines);
+      P.lines.slice(0, this.nLines).forEach((L, l) => (crest[l] = sampleSeries(L.series, tBase)));
+      this.dev.queue.writeBuffer(this.buf.C, K.CTRL_LINECREST_OFFSET, crest);
+    }
   }
 
   private ensureStaging(bytes: number): GPUBuffer {
@@ -473,6 +534,7 @@ export class GpuEngine implements Engine {
       pass.setBindGroup(0, this.groups[name]);
       pass.dispatchWorkgroups(groups);
     };
+    if (this.nLineCells > 0) d('zline', Math.ceil(this.nLineCells / 64));
     if (order === 1) {
       d('bc', gB);
       d('flux1', gF);
