@@ -266,6 +266,9 @@ export class App {
       rainfall: s.rainfall.enabled ? { ...s.rainfall } : null,
       velocityCap: 25,
       arrivalDepth: s.simulation.arrivalDepth,
+      manningField: null,
+      lines: [],
+      links: [],
     };
   }
 

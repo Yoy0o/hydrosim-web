@@ -8,6 +8,9 @@
  *  - Fully implicit Manning friction (solved exactly for the momentum magnitude)
  *  - Boundary conditions via two layers of ghost cells: wall / open / water level series / tide
  *  - Mass sources: point inflows, rainfall, constant infiltration
+ *  - Spatially varying Manning roughness (per-cell field)
+ *  - Hydraulic structures: time-varying beds along lines (gates, breaches) and culverts/pumps
+ *    linking two cells (static levees/weirs/buildings are baked into the bed by the caller)
  *  - Mass balance audit and result envelopes (max depth, max speed, max hazard, arrival time)
  *
  * Pure TypeScript, no DOM dependencies: used by the Web Worker and by the unit tests.
@@ -43,6 +46,42 @@ export interface RainSpec {
   infiltration: number;
 }
 
+/**
+ * Time-varying bed along a structure line. mode 'raise': z = max(zGround, crest(t)); 'lower' (breach):
+ * z = min(zGround, crest(t)); 'set' (gate): z = crest(t).
+ */
+export interface DynamicLineSpec {
+  /** Interior cell indices (row-major j*nx+i). */
+  cells: number[];
+  /** Bed before the time-varying structure, per cell (m). */
+  zGround: number[];
+  /** Crest elevation over time (m). */
+  series: TimeSeries;
+  mode: 'raise' | 'lower' | 'set';
+}
+
+/** Bed of a dynamic-line cell for a given crest. */
+export function lineBed(mode: DynamicLineSpec['mode'], zGround: number, crest: number): number {
+  return mode === 'raise' ? Math.max(zGround, crest) : mode === 'lower' ? Math.min(zGround, crest) : crest;
+}
+
+/** Culvert (orifice equation) or pump moving water between two cells. */
+export interface LinkSpec {
+  kind: 'culvert' | 'pump';
+  /** Interior cell indices of the inlet (a) and the outlet (b). */
+  a: number;
+  b: number;
+  /** Culvert flow area (m^2) and discharge coefficient. */
+  area: number;
+  cd: number;
+  /** Pump discharge Q(t) from a to b (m^3/s). */
+  series: TimeSeries;
+}
+
+/** Maximum number of links / dynamic lines (GPU control block size). */
+export const MAX_LINKS = 16;
+export const MAX_LINES = 16;
+
 export interface SolverParams {
   gravity: number;
   cfl: number;
@@ -60,6 +99,12 @@ export interface SolverParams {
   velocityCap: number;
   /** Depth threshold (m) for flood arrival time / wet-area statistics. */
   arrivalDepth: number;
+  /** Per-cell Manning coefficient (row-major, nx*ny); null = uniform `manning`. */
+  manningField: Float32Array | null;
+  /** Gates / breaches: beds that change with time. */
+  lines: DynamicLineSpec[];
+  /** Culverts and pumps. */
+  links: LinkSpec[];
 }
 
 export interface GridSpec {
@@ -82,7 +127,30 @@ export function defaultSolverParams(): SolverParams {
     rainfall: null,
     velocityCap: 25,
     arrivalDepth: 0.05,
+    manningField: null,
+    lines: [],
+    links: [],
   };
+}
+
+/**
+ * Discharge of a culvert from the heads at its ends (orifice equation, positive a -> b).
+ * Flow only leaves a cell that holds water.
+ */
+export function culvertDischarge(
+  g: number,
+  hDry: number,
+  zA: number,
+  hA: number,
+  zB: number,
+  hB: number,
+  area: number,
+  cd: number,
+): number {
+  const dH = zA + hA - (zB + hB);
+  if (dH > 0 && hA > hDry) return cd * area * Math.sqrt(2 * g * dH);
+  if (dH < 0 && hB > hDry) return -cd * area * Math.sqrt(-2 * g * dH);
+  return 0;
 }
 
 export function boundaryLevel(spec: BoundarySpec, t: number): number {
@@ -311,6 +379,12 @@ export class SWESolver {
 
   private srcCells: SourceCells[] = [];
   private extraSources: SourceCells[] = [];
+  // culvert/pump state captured at the start of each step
+  private readonly linkQ = new Float64Array(MAX_LINKS);
+  private readonly linkHA = new Float64Array(MAX_LINKS);
+  private readonly linkHB = new Float64Array(MAX_LINKS);
+  /** Signed volume moved by each link during the last step (m^3, + = a -> b). */
+  readonly linkVolLast = new Float64Array(MAX_LINKS);
 
   constructor(grid: GridSpec, bed: ArrayLike<number>, params: SolverParams) {
     const { nx, ny, dx, dy } = grid;
@@ -805,6 +879,30 @@ export class SWESolver {
     applySources(this.srcCells);
     applySources(this.extraSources);
 
+    // Culverts / pumps: volume from the start-of-step state, limited to 90 % of the water in the source cell
+    const links = P.links;
+    for (let k = 0; k < links.length; k++) {
+      const L = links[k];
+      let v = L.kind === 'pump' ? Math.max(0, integrateSeries(L.series, t0, t1)) : this.linkQ[k] * dt;
+      if (v > 0) v = Math.min(v, 0.9 * this.linkHA[k] * area);
+      else if (v < 0) v = Math.max(v, -0.9 * this.linkHB[k] * area);
+      if (v === 0) continue;
+      const pa = this.idx(L.a % nx, Math.floor(L.a / nx));
+      const pb = this.idx(L.b % nx, Math.floor(L.b / nx));
+      const from = v > 0 ? pa : pb;
+      const to = v > 0 ? pb : pa;
+      const dh = Math.abs(v) / area;
+      const hf = h[from];
+      if (hf > 0) {
+        const r = Math.max(0, hf - dh) / hf;
+        hu[from] *= r;
+        hv[from] *= r;
+      }
+      h[from] = hf - dh;
+      h[to] += dh;
+      this.linkVolLast[k] = v;
+    }
+
     // Rainfall / infiltration (mm/h -> m/s)
     let rainDepth = 0;
     let infDepth = 0;
@@ -814,7 +912,8 @@ export class SWESolver {
       infDepth = (Math.max(0, rf.infiltration) / 3.6e6) * dt;
     }
     const g = P.gravity;
-    const n2g = g * P.manning * P.manning;
+    const n2gU = g * P.manning * P.manning;
+    const mf = P.manningField;
     const hd = P.hDry;
     const vcap = P.velocityCap;
     const tNew = t1;
@@ -853,6 +952,7 @@ export class SWESolver {
         } else {
           let q = Math.sqrt(qx * qx + qy * qy);
           if (q > 0) {
+            const n2g = mf ? g * mf[c] * mf[c] : n2gU;
             if (n2g > 0) {
               const a = (dt * n2g) / (hn * hn * Math.cbrt(hn));
               const qn = (2 * q) / (1 + Math.sqrt(1 + 4 * a * q));
@@ -945,6 +1045,35 @@ export class SWESolver {
     return s > 0 ? this.params.cfl / s : this.params.maxDt;
   }
 
+  /** Gates / breaches: set the bed of their cells for time t (crest held for the whole step). */
+  private applyLines(t: number): void {
+    const { nx, z } = this;
+    for (const L of this.params.lines) {
+      const crest = sampleSeries(L.series, t);
+      for (let k = 0; k < L.cells.length; k++) {
+        const c = L.cells[k];
+        const i = c % nx;
+        z[this.idx(i, (c - i) / nx)] = lineBed(L.mode, L.zGround[k], crest);
+      }
+    }
+    this.fillBedGhosts();
+  }
+
+  /** Culvert discharges and available depths from the start-of-step state. */
+  private prepareLinks(): void {
+    const P = this.params;
+    const { nx } = this;
+    for (let k = 0; k < P.links.length && k < MAX_LINKS; k++) {
+      const L = P.links[k];
+      const pa = this.idx(L.a % nx, Math.floor(L.a / nx));
+      const pb = this.idx(L.b % nx, Math.floor(L.b / nx));
+      this.linkHA[k] = this.h[pa];
+      this.linkHB[k] = this.h[pb];
+      this.linkQ[k] =
+        L.kind === 'culvert' ? culvertDischarge(P.gravity, P.hDry, this.z[pa], this.h[pa], this.z[pb], this.h[pb], L.area, L.cd) : 0;
+    }
+  }
+
   /**
    * Advance one adaptive time step. `dtLimit` caps the step (e.g. to hit output times exactly).
    * Returns the time step used.
@@ -954,6 +1083,8 @@ export class SWESolver {
     const second = P.order === 2;
     if (second) this.ensureSlopeArrays();
     const t = this.t;
+    if (P.lines.length) this.applyLines(t);
+    if (P.links.length) this.prepareLinks();
     this.applyBoundaries(t);
     this.computeVelocities();
     if (second) this.computeSlopes();
