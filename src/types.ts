@@ -1,6 +1,7 @@
 import type { BoundarySpec, RainSpec, Side } from './core/solver';
 import type { TimeSeries } from './core/timeseries';
 import type { BBox } from './data/geo';
+import type { BuildingRaster, LandCoverRaster } from './model';
 
 export type GeoRef =
   | { kind: 'local' }
@@ -63,6 +64,88 @@ export interface RainfallDef extends RainSpec {
   origin?: string;
 }
 
+/** Polygon with its own Manning coefficient (overrides land cover). */
+export interface RoughnessZone {
+  id: string;
+  name: string;
+  polygon: [number, number][];
+  n: number;
+}
+
+export interface RoughnessDef {
+  /** Use the land-cover raster (OpenStreetMap) when available. */
+  useLandcover: boolean;
+  /** Manning n per land-cover class key. */
+  table: Record<string, number>;
+  zones: RoughnessZone[];
+}
+
+export interface BuildingPolygon {
+  id: string;
+  polygon: [number, number][];
+  /** Height above ground (m). */
+  height: number;
+}
+
+/**
+ * Buildings: 'block' raises the bed of cells at least half covered by buildings (water flows around them),
+ * 'resistance' blends a high Manning n by the covered fraction (sub-grid), 'off' ignores them.
+ */
+export interface BuildingsDef {
+  mode: 'off' | 'block' | 'resistance';
+  /** Height used when a footprint has none (m). */
+  defaultHeight: number;
+  /** Manning n of building-covered area in 'resistance' mode. */
+  n: number;
+  /** Include footprints imported from OpenStreetMap. */
+  useOsm: boolean;
+  /** Footprints drawn by the user. */
+  items: BuildingPolygon[];
+}
+
+export type StructureKind = 'levee' | 'weir' | 'gate' | 'breach';
+
+/**
+ * Structure line ("z-line"): levee raises the bed to the crest, weir sets it to the crest; gate and breach
+ * are time-varying crests (gate: closed crest -> sill between t1 and t2; breach: crest -> bottom from t1 over ramp).
+ */
+export interface StructureLine {
+  id: string;
+  name: string;
+  kind: StructureKind;
+  points: [number, number][];
+  /** Crest elevation (m); for gates the closed crest, for breaches the initial crest. */
+  crest: number;
+  /** Line width (m); <= cell size means a single 4-connected line of cells. */
+  width: number;
+  /** Gate sill / final breach bottom (m); default: lowest ground along the line. */
+  bottom?: number;
+  /** Gate opening time / breach start (s). */
+  t1?: number;
+  /** Gate closing time (s), optional. */
+  t2?: number;
+  /** Gate travel time / breach development duration (s). */
+  ramp?: number;
+}
+
+export type LinkKind = 'culvert' | 'pump';
+
+/** Culvert (orifice equation, barrels of a given diameter) or pump between an inlet and an outlet. */
+export interface LinkDef {
+  id: string;
+  name: string;
+  kind: LinkKind;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  diameter: number;
+  count: number;
+  cd: number;
+  /** Pump discharge Q(t) (m^3/s). */
+  series: TimeSeries;
+}
+
 export interface SimSettings {
   /** Simulated duration (s). */
   duration: number;
@@ -108,6 +191,8 @@ export interface ViewSettings {
   basemap: 'none' | 'satellite' | 'osm';
   showBoundaries: boolean;
   waterOpacity: number;
+  /** Overlay drawn on the terrain. */
+  terrainOverlay: 'none' | 'roughness' | 'landcover' | 'buildings';
 }
 
 export interface Scenario {
@@ -124,6 +209,11 @@ export interface Scenario {
   /** ISO date-time of t = 0 for real-data driven scenarios (UTC). */
   startTime?: string;
   view?: Partial<ViewSettings>;
+  /** Spatially varying roughness (optional for backward compatibility; see ensureScenarioDefaults). */
+  roughness?: RoughnessDef;
+  buildings?: BuildingsDef;
+  structures?: StructureLine[];
+  links?: LinkDef[];
 }
 
 export interface LoadedCase {
@@ -133,6 +223,9 @@ export interface LoadedCase {
   initialDepth?: Float32Array;
   /** Suggested basemap for real-world terrain. */
   basemap?: ViewSettings['basemap'];
+  /** Rasters imported from OpenStreetMap (buildings, land cover). */
+  buildings?: BuildingRaster | null;
+  landcover?: LandCoverRaster | null;
 }
 
 let idCounter = 0;

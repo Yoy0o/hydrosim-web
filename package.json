@@ -13,7 +13,9 @@
     "fetch-dem": "node scripts/fetch-dem.mjs"
   },
   "dependencies": {
+    "@mapbox/vector-tile": "^3.0.0",
     "leaflet": "^1.9.4",
+    "pbf": "^5.1.2",
     "three": "^0.187.0",
     "uplot": "^1.6.32"
   },

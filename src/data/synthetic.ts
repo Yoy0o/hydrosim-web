@@ -97,8 +97,12 @@ export const VALLEY_TOWN = { x0: 3300, x1: 4300, y0: 0, y1: 0 };
   VALLEY_TOWN.y1 = m + 520;
 })();
 
-/** Synthetic meandering river valley (6 km x 4 km) with a levee-protected town. */
-export function riverValleyTerrain(dx = 20): Terrain {
+/**
+ * Synthetic meandering river valley (6 km x 4 km) with a levee-protected town. With townBlocks = false the
+ * 7 m town blocks are left out of the DEM (to be modelled as buildings, see valleyTownBlocks).
+ */
+export function riverValleyTerrain(dx = 20, opts: { townBlocks?: boolean } = {}): Terrain {
+  const withBlocks = opts.townBlocks ?? true;
   const nx = Math.round(6000 / dx);
   const ny = Math.round(4000 / dx);
   const T = VALLEY_TOWN;
@@ -114,13 +118,27 @@ export function riverValleyTerrain(dx = 20): Terrain {
     // levee on the north bank in front of the town
     if (y > yc && d >= 34 && d <= 52 && x >= 3000 && x <= 4600) z += 2.6 * Math.sin((Math.PI * (d - 34)) / 18);
     // town blocks (40 m buildings on a 60 m grid)
-    if (x >= T.x0 && x <= T.x1 && y >= T.y0 && y <= T.y1) {
+    if (withBlocks && x >= T.x0 && x <= T.x1 && y >= T.y0 && y <= T.y1) {
       const bx = (x - T.x0) % 60;
       const by = (y - T.y0) % 60;
       if (bx < 40 && by < 40) z += 7;
     }
     return z;
   });
+}
+
+/** Footprints of the synthetic town blocks: 40 m squares on a 60 m pitch, clipped to the town extent. */
+export function valleyTownBlocks(): [number, number][][] {
+  const T = VALLEY_TOWN;
+  const out: [number, number][][] = [];
+  for (let y = T.y0; y < T.y1; y += 60) {
+    for (let x = T.x0; x < T.x1; x += 60) {
+      const x2 = Math.min(x + 40, T.x1);
+      const y2 = Math.min(y + 40, T.y1);
+      out.push([[x, y], [x2, y], [x2, y2], [x, y2]]);
+    }
+  }
+  return out;
 }
 
 export function coastLine(x: number): number {

@@ -6,6 +6,7 @@ import { defaultSolverParams, type SolverParams } from '../core/solver';
 import { initialDepth, sectionCells } from '../core/geometry';
 import { ritter } from '../core/analytic';
 import { PRESETS } from '../data/presets';
+import { buildModelInputs } from '../model';
 import { CpuEngine, type Engine, type EngineInit } from '../worker/engine';
 import type { Scenario, Terrain } from '../types';
 
@@ -76,10 +77,12 @@ function compare(a: Float32Array, b: Float32Array, thr = 0.01): { maxDiff: numbe
 async function presetCase(id: string, T: number, overrides: Partial<SolverParams> = {}): Promise<void> {
   const p = PRESETS.find((x) => x.id === id)!;
   const c = await p.load();
-  const t = c.terrain;
   const sc = c.scenario;
+  // effective bed, Manning field, structure lines and links exactly as the app builds them
+  const m = buildModelInputs(c.terrain, sc, { buildings: c.buildings ?? null, landcover: c.landcover ?? null });
+  const t: Terrain = { ...c.terrain, z: m.bed };
   const h0 = c.initialDepth ?? initialDepth(t, sc.initial.baseLevel, sc.initial.regions);
-  const params = { ...paramsFrom(sc), ...overrides };
+  const params = { ...paramsFrom(sc), manningField: m.manning, lines: m.lines, links: m.links, ...overrides };
   const cpu = new CpuEngine(initFor(t, sc, h0, params));
   const gpu = await GpuEngine.create(initFor(t, sc, h0, params));
   const msC = await runTo(cpu, T);
@@ -93,7 +96,7 @@ async function presetCase(id: string, T: number, overrides: Partial<SolverParams
   const relErrC = Math.abs(sc1.massError) / Math.max(sc1.volume, sc1.volume0, sc1.rain + sc1.inflow + sc1.boundaryIn);
   const hmax = Math.max(...Array.from(fc.h));
   const r = {
-    case: `${id} (order ${params.order}, ${t.nx}x${t.ny}, T=${T}s)`,
+    case: `${id} (order ${params.order}, ${t.nx}x${t.ny}, T=${T}s${m.lines.length || m.links.length ? `, ${m.lines.length} lines, ${m.links.length} links` : ''})`,
     stepsCpu: sc1.step,
     stepsGpu: sg.step,
     msCpu: Math.round(msC),
@@ -231,6 +234,10 @@ async function main(): Promise<void> {
       await presetCase('coastal-surge', 3600);
       await presetCase('malpasset', 1200);
       await presetCase('ahr-2021', 4 * 3600);
+    }
+    if (which === 'all' || which === 'parity' || which === 'structures') {
+      await presetCase('flood-defense', 4 * 3600);
+      await presetCase('flood-defense', 3 * 3600, { order: 2 });
     }
     if (which === 'all' || which === 'bench') {
       await bench(256, 1, true);

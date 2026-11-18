@@ -2,7 +2,9 @@
 import type { Side } from '../core/solver';
 import { thackerPeriod, thackerSurface } from '../core/analytic';
 import { triangularHydrograph } from '../core/timeseries';
-import type { LoadedCase, Scenario, Terrain, ViewSettings } from '../types';
+import { cellOf, rasterizeLine } from '../core/raster';
+import { buildingRasterFromPolygons } from '../model';
+import type { LinkDef, LoadedCase, Scenario, StructureLine, Terrain, ViewSettings } from '../types';
 import { uid } from '../types';
 import { cosLatOf, lonLatToLocal } from './geo';
 import { dischargeSeriesFromDaily, rainSeriesFromHourly, type DailyDischarge, type HourlyRain } from './openmeteo';
@@ -15,6 +17,7 @@ import {
   thackerTerrain,
   threeHumpsTerrain,
   valleyCenter,
+  valleyTownBlocks,
 } from './synthetic';
 import { loadBundledDEM } from './terrarium';
 import { fillDepressions } from '../core/hydro';
@@ -36,6 +39,7 @@ export function defaultView(): ViewSettings {
     basemap: 'none',
     showBoundaries: true,
     waterOpacity: 0.85,
+    terrainOverlay: 'none',
   };
 }
 
@@ -269,6 +273,100 @@ export const PRESETS: PresetInfo[] = [
         view: { exaggeration: 3, colorMode: 'realistic', particleCount: 14000 },
       };
       return { terrain, scenario };
+    },
+  },
+  {
+    id: 'flood-defense',
+    group: '合成场景',
+    name: '城镇圩区防洪调度（建筑物 · 溃口 · 闸 · 泵）',
+    description:
+      '在合成河谷上演示糙率分区、建筑物与水工结构：城镇由沿河堤防与两道横堤围成圩区，136 栋街区建筑按阻水块（高 7 m）处理；糙率分区为主槽 0.03、滩地 0.045、街道 0.025、下游林地 0.1。洪水上涨时穿堤涵洞（2 孔 Φ1.5 m，无拍门）倒灌；2.0 h 城镇上游段堤防溃决（宽 80 m，20 min 冲至滩面）；2.5 h 起排涝泵站以 15 m³/s 抽排入河；3.5 h 下游排涝闸开启，圩内积水回排。',
+    load: async () => {
+      const terrain = riverValleyTerrain(20, { townBlocks: false });
+      const g = { nx: terrain.nx, ny: terrain.ny, dx: terrain.dx, dy: terrain.dy };
+      const T = VALLEY_TOWN;
+      const buildings = buildingRasterFromPolygons(g, valleyTownBlocks().map((polygon) => ({ polygon, height: 7 })), '合成城镇街区（40 m 方块，高 7 m）');
+      const r1 = (v: number): number => Math.round(v * 10) / 10;
+      const zAt = (x: number, y: number): number => terrain.z[cellOf(g, x, y)];
+      /** Point at distance d north of the channel centre line. */
+      const bank = (x: number, d: number): [number, number] => [x, valleyCenter(x) + d];
+      const along = (xa: number, xb: number, d: number, step = 50): [number, number][] => {
+        const n = Math.max(1, Math.round((xb - xa) / step));
+        return Array.from({ length: n + 1 }, (_, k) => bank(xa + ((xb - xa) * k) / n, d));
+      };
+      /** Highest floodplain ground behind the levee along a reach. */
+      const floodplain = (xa: number, xb: number): number => {
+        let m = -Infinity;
+        for (let x = xa; x <= xb; x += 20) m = Math.max(m, zAt(x, valleyCenter(x) + 70));
+        return m;
+      };
+      const lineGround = (pts: [number, number][], w: number): number => Math.min(...rasterizeLine(g, pts, w).map((c) => terrain.z[c]));
+      // polder: river levee in four reaches with stepped crests + cross levees tying into the valley side
+      const reaches: [number, number][] = [[3000, 3400], [3400, 3800], [3800, 4200], [4200, 4600]];
+      const crest = reaches.map(([a, b]) => r1(floodplain(a, b) + 2.4));
+      const structures: StructureLine[] = reaches.map(([a, b], k) => ({ id: uid('w'), name: `沿河堤防 ${k + 1}`, kind: 'levee', points: along(a, b, 43), crest: crest[k], width: 0 }));
+      const cross = (x: number, name: string, c: number): StructureLine => ({ id: uid('w'), name, kind: 'levee', points: [bank(x, 43), bank(x, 1200)], crest: c, width: 0 });
+      structures.push(cross(3000, '上游横堤', r1(floodplain(2900, 3000) + 3)), cross(4600, '下游横堤', crest[3]));
+      const breachPts = along(3660, 3740, 43, 20);
+      structures.push({ id: uid('w'), name: '城镇段溃口', kind: 'breach', points: breachPts, crest: crest[1], width: 24, bottom: r1(lineGround(breachPts, 24)), t1: 2 * 3600, ramp: 1200 });
+      const gatePts = along(4480, 4540, 43, 20);
+      structures.push({ id: uid('w'), name: '排涝闸', kind: 'gate', points: gatePts, crest: crest[3], width: 24, bottom: r1(lineGround(gatePts, 24)), t1: 3.5 * 3600, t2: 0, ramp: 600 });
+      // culvert through the levee (no flap gate) and a drainage pumping station at the low end of the polder
+      const [px, py] = snapLowest(terrain, 4420, valleyCenter(4420) + 85, 30); // inside the polder, behind the levee
+      const links: LinkDef[] = [
+        { id: uid('l'), name: '穿堤涵洞', kind: 'culvert', x1: 3200, y1: valleyCenter(3200) + 90, x2: 3200, y2: valleyCenter(3200), diameter: 1.5, count: 2, cd: 0.6, series: [[0, 0]] },
+        { id: uid('l'), name: '排涝泵站', kind: 'pump', x1: px, y1: py, x2: 4420, y2: valleyCenter(4420), diameter: 1, count: 1, cd: 0.6, series: [[0, 0], [9000, 0], [9300, 15], [21600, 15]] },
+      ];
+      // roughness zones: channel band, town streets, riparian forest downstream
+      const north = along(0, 6000, 30, 100);
+      const south = along(0, 6000, -30, 100).reverse();
+      const forest: [number, number][] = [...along(4700, 5900, 60, 100), ...along(4700, 5900, 450, 100).reverse()];
+      const sx = 40;
+      const scenario: Scenario = {
+        name: '城镇圩区防洪调度',
+        description: PRESETS.find((p) => p.id === 'flood-defense')!.description,
+        manning: 0.045,
+        boundaries: { west: { type: 'wall' }, east: { type: 'open' }, south: { type: 'wall' }, north: { type: 'wall' } },
+        initial: { baseLevel: null, regions: [] },
+        sources: [
+          {
+            id: uid('q'),
+            name: '上游来流',
+            x: sx,
+            y: valleyCenter(sx),
+            radius: 30,
+            series: triangularHydrograph(40, 900, 1.5 * 3600, 5 * 3600).concat([[8 * 3600, 40]]),
+            origin: '设计洪水过程线（三角形）',
+          },
+        ],
+        rainfall: { enabled: false, series: [[0, 20], [3600, 20], [3600.001, 0]], stepwise: false, infiltration: 0 },
+        simulation: { duration: 6 * 3600, cfl: 0.5, order: 1, outputInterval: 120, maxDt: 10, hDry: 1e-6, arrivalDepth: 0.05 },
+        probes: [
+          { id: uid('p'), name: 'P1 上游河道', x: 1000, y: valleyCenter(1000) },
+          { id: uid('p'), name: 'P2 溃口内侧', x: 3700, y: valleyCenter(3700) + 110 },
+          { id: uid('p'), name: 'P3 城镇中心', x: (T.x0 + T.x1) / 2 + 50, y: (T.y0 + T.y1) / 2 + 20 },
+          { id: uid('p'), name: 'P4 泵站前池', x: px, y: py },
+          { id: uid('p'), name: 'P5 下游河道', x: 5500, y: valleyCenter(5500) },
+        ],
+        sections: [
+          { id: uid('s'), name: 'S1 溃口进水', x1: 3790, y1: valleyCenter(3790) + 75, x2: 3610, y2: valleyCenter(3610) + 75 },
+          { id: uid('s'), name: 'S2 城镇下游河道', x1: 4800, y1: valleyCenter(4800) - 250, x2: 4800, y2: valleyCenter(4800) + 30 },
+        ],
+        view: { exaggeration: 3, colorMode: 'realistic', particleCount: 14000 },
+        roughness: {
+          useLandcover: true,
+          table: {},
+          zones: [
+            { id: uid('z'), name: '主河槽', polygon: [...north, ...south], n: 0.03 },
+            { id: uid('z'), name: '城镇街道', polygon: [[T.x0, T.y0], [T.x1, T.y0], [T.x1, T.y1], [T.x0, T.y1]], n: 0.025 },
+            { id: uid('z'), name: '下游河岸林', polygon: forest, n: 0.1 },
+          ],
+        },
+        buildings: { mode: 'block', defaultHeight: 7, n: 0.3, useOsm: true, items: [] },
+        structures,
+        links,
+      };
+      return { terrain, scenario, buildings };
     },
   },
   {
