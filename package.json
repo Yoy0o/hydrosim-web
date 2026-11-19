@@ -2,7 +2,29 @@
   "name": "hydrosim-web",
   "version": "0.1.0",
   "private": true,
-  "description": "HydroSim Web - browser-based 2D shallow water hydrodynamic simulator (Three.js + Web Worker)",
+  "description": "Browser-based 2D shallow-water hydrodynamic simulator (WebGPU + Web Worker + Three.js)",
+  "keywords": [
+    "hydrodynamics",
+    "shallow-water-equations",
+    "flood-simulation",
+    "webgpu",
+    "threejs",
+    "typescript",
+    "gis",
+    "dam-break"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/Yoy0o/hydrosim-web#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yoy0o/hydrosim-web.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Yoy0o/hydrosim-web/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
