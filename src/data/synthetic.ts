@@ -176,3 +176,31 @@ export function coastalTerrain(dx = 20): Terrain {
     return z;
   });
 }
+
+/** Feature positions of the synthetic ocean basin (local metres). */
+export const OCEAN_FEATURES = {
+  seamount: { x: 22000, y: 16000, top: -30 },
+  island: { x: 27000, y: 35000 },
+  ridge: { x: 56000, saddleY: 25000, crest: -80, saddle: -223 },
+};
+
+/**
+ * Synthetic ocean basin (80 km x 50 km, 300 m deep) for ocean-current demos: a Gaussian seamount rising
+ * to 30 m below the surface, a flat-topped island (~2.5 km radius at sea level), and a north-south ridge
+ * (crest 80 m deep) with a saddle 223 m deep that funnels the flow. Gentle sand-wave texture on the floor.
+ */
+export function oceanTerrain(dx = 400): Terrain {
+  const nx = Math.round(80000 / dx);
+  const ny = Math.round(50000 / dx);
+  const F = OCEAN_FEATURES;
+  return gridTerrain('合成海域：海山、岛屿与海脊（80 km × 50 km）', nx, ny, dx, (x, y) => {
+    let z = -300 + 6 * fbm(x / 2500, y / 2500, 21);
+    z += 270 * Math.exp(-0.5 * (((x - F.seamount.x) ** 2 + (y - F.seamount.y) ** 2) / 4500 ** 2));
+    const ri = Math.hypot(x - F.island.x, y - F.island.y) / 3800;
+    z += 360 * Math.exp(-(ri ** 4));
+    const ridge = Math.exp(-(((x - F.ridge.x) / 2500) ** 2));
+    const saddle = 1 - 0.65 * Math.exp(-(((y - F.ridge.saddleY) / 3500) ** 2));
+    z += 220 * ridge * saddle;
+    return z;
+  });
+}

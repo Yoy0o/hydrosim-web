@@ -10,8 +10,10 @@ import { cosLatOf, lonLatToLocal } from './geo';
 import { dischargeSeriesFromDaily, rainSeriesFromHourly, type DailyDischarge, type HourlyRain } from './openmeteo';
 import {
   VALLEY_TOWN,
+  OCEAN_FEATURES,
   coastLine,
   coastalTerrain,
+  oceanTerrain,
   partialDamBreakTerrain,
   riverValleyTerrain,
   thackerTerrain,
@@ -367,6 +369,43 @@ export const PRESETS: PresetInfo[] = [
         links,
       };
       return { terrain, scenario, buildings };
+    },
+  },
+  {
+    id: 'ocean-currents',
+    group: '合成场景',
+    name: '海底地形中的洋流（海山 · 岛屿 · 海脊）',
+    description:
+      '80 km × 50 km 合成海域（水深 300 m）：东向外海流 0.4 m/s 依次经过海山（顶部水深 30 m）、岛屿和带鞍部的海脊。北纬 30° 科氏力（f = 7.3×10⁻⁵ s⁻¹），初始流场与水面处于地转平衡；东西两侧为外海开边界（特征型、无反射），南北为闭边界，海水密度 1025 kg/m³，二阶格式。可观察海山上方的地形绕流（泰勒柱效应）、岛屿尾流涡街、海脊鞍部的流量集中，用"底床剪切应力"着色查看海底冲刷强度。',
+    load: async () => {
+      const terrain = oceanTerrain(400);
+      const F = OCEAN_FEATURES;
+      const U = 0.4;
+      const ocean = { type: 'ocean', mean: 0, amplitude: 0, period: 12.42 * 3600, phase: 0, u: U, v: 0 } as const;
+      const scenario: Scenario = {
+        name: '海底地形中的洋流',
+        description: PRESETS.find((p) => p.id === 'ocean-currents')!.description,
+        manning: 0.022,
+        boundaries: { west: { ...ocean }, east: { ...ocean }, south: { type: 'wall' }, north: { type: 'wall' } },
+        initial: { baseLevel: 0, regions: [], velocity: { u: U, v: 0 } },
+        sources: [],
+        rainfall: { enabled: false, series: [[0, 0]], stepwise: false, infiltration: 0 },
+        simulation: { duration: 48 * 3600, cfl: 0.45, order: 2, outputInterval: 1800, maxDt: 30, hDry: 1e-6, arrivalDepth: 0.05 },
+        probes: [
+          { id: uid('p'), name: 'P1 上游外海', x: 8000, y: 25000 },
+          { id: uid('p'), name: 'P2 海山顶', x: F.seamount.x, y: F.seamount.y },
+          { id: uid('p'), name: 'P3 岛屿尾流', x: F.island.x + 8000, y: F.island.y },
+          { id: uid('p'), name: 'P4 海脊鞍部', x: F.ridge.x, y: F.ridge.saddleY },
+          { id: uid('p'), name: 'P5 海脊顶', x: F.ridge.x, y: 42000 },
+        ],
+        sections: [
+          { id: uid('s'), name: 'S1 入口断面', x1: 4000, y1: 200, x2: 4000, y2: 49800 },
+          { id: uid('s'), name: 'S2 海脊鞍部', x1: F.ridge.x, y1: F.ridge.saddleY - 6000, x2: F.ridge.x, y2: F.ridge.saddleY + 6000 },
+        ],
+        physics: { coriolis: true, latitude: 30, wind: { enabled: false, speed: [[0, 10]], direction: 270 }, waterDensity: 1025 },
+        view: { exaggeration: 20, colorMode: 'speed', colormap: 'turbo', particleCount: 16000, showDepth: 0.05, waterOpacity: 0.8 },
+      };
+      return { terrain, scenario };
     },
   },
   {
