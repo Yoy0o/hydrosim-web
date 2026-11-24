@@ -31,4 +31,5 @@ Brufau et al.; Thacker 1981; Malpasset dam break 1959). No third-party code or d
 ## Libraries
 
 Runtime dependencies are installed from npm and keep their own licences: three (MIT), leaflet (BSD-2-Clause),
-uPlot (MIT), pbf (BSD-3-Clause), @mapbox/vector-tile (BSD-3-Clause).
+uPlot (MIT), pbf (BSD-3-Clause), @mapbox/vector-tile (BSD-3-Clause), marked (MIT), KaTeX (MIT, including its bundled
+fonts under the SIL Open Font License 1.1).

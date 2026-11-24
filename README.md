@@ -30,6 +30,8 @@ satellite imagery.
 | Polder flood-defence operation (buildings · breach · gate · culvert · pump) | OpenStreetMap land-use roughness (Malpasset / Fréjus) |
 |---|---|
 | ![](docs/images/flood-defense.jpg) | ![](docs/images/osm-landuse.jpg) |
+| **Ocean current over a seamount, island and ridge (Coriolis · bed shear stress)** | **In-app algorithm documentation (formulas, code locations, verification)** |
+| ![](docs/images/ocean-currents.jpg) | ![](docs/images/algorithm-docs.jpg) |
 
 ## Quick start
 
@@ -60,14 +62,15 @@ WebGPU validation / benchmark page (dev server): <http://127.0.0.1:5173/gpu-test
 - Roughness: base Manning *n* + **OpenStreetMap land-use classes** (13 editable classes) + **hand-drawn roughness zones** (priority: zone > land use > base); edits apply live while running
 - **Buildings**: import outlines and heights from OpenStreetMap or draw them; treated either as **blocking blocks** (cells ≥ 50 % covered are raised) or as **high roughness** (Manning *n* blended by coverage — for coarse grids)
 - **Hydraulic structures** (polyline / two-point tools; identical results on CPU and GPU engines): levees, weirs, **gates** (timed opening/closing), **breaches** (linear erosion over a development time), **culverts** (orifice equation, bidirectional, multi-barrel) and **pumps** (discharge hydrograph with automatic throttling when the intake runs dry)
-- Boundary conditions per side: wall, free outflow, stage hydrograph, sinusoidal tide
-- Initial conditions: uniform water level, **interactive water polygons** (reservoir / dam break)
+- Boundary conditions per side: wall, free outflow (normal-depth assumption on sloping beds), stage hydrograph, sinusoidal tide and **open sea** (external level + current imposed as the far-field state of the boundary Riemann problem — characteristic / Flather-type, non-reflecting for outgoing waves)
+- Initial conditions: uniform water level, **interactive water polygons** (reservoir / dam break), **uniform initial current** (with the geostrophic surface tilt when rotation is on)
+- **Large-scale physics**: **Coriolis force** (f-plane, exact rotation per step) and **wind stress** (uniform wind speed series and direction, Wu 1982 drag coefficient), water density (fresh / sea water)
 - Sources and sinks: point inflow hydrographs (constant / triangular / custom / **GloFAS**), areal rainfall (constant / design storm / custom / **ERA5**) with constant infiltration
 - Run settings: duration, output interval, 1st/2nd order, CFL, max step, wet/dry threshold
 
 **Solver**
 - Finite-volume Godunov scheme with HLL Riemann solver and **Chen–Noelle hydrostatic reconstruction** (well-balanced, positivity-preserving)
-- Optional second order (MUSCL with minmod + Heun), fully implicit Manning friction, CFL-adaptive time step, parameters editable while running
+- Optional second order (MUSCL with minmod + Heun, implicit Manning friction inside each stage so uniform flow is an exact fixed point), CFL-adaptive time step, parameters editable while running
 - **Two compute engines** (switchable, GPU preferred by default):
   - **GPU · WebGPU** (`src/gpu/`): WGSL compute shaders with time stepping, source integration and gauge recording all on the GPU. Depth differs from the CPU engine by ≤ 0.3 mm with identical wet cells, and is **22–46× faster** (Intel integrated GPU); million-cell grids are feasible
   - **CPU · Web Worker** (`src/core/solver.ts`): double-precision reference implementation, used automatically when WebGPU is unavailable
@@ -75,13 +78,24 @@ WebGPU validation / benchmark page (dev server): <http://127.0.0.1:5173/gpu-test
 
 **Post-processing and visualisation**
 - 3D terrain (hypsometric tint + hillshade / satellite / OSM texture, contours, vertical exaggeration)
-- Animated water surface (Fresnel, specular, flow ripples, whitewater) or colour by depth, speed, stage, Froude number, hazard h(V+0.5), **maximum depth / speed / hazard envelopes**, **arrival time**
-- Flow particles, legends, hover read-out; gauge hydrographs, cross-section discharge, mass balance, profiles and input-series charts (uPlot)
+- Animated water surface (Fresnel, specular, flow ripples, whitewater) or colour by depth, speed, stage, Froude number, hazard h(V+0.5), **bed shear stress τb**, **maximum depth / speed / hazard envelopes**, **arrival time**
+- Flow particles, legends, hover read-out (incl. τb); gauge hydrographs, cross-section discharge, mass balance, profiles and input-series charts (uPlot)
 - Result-frame recording with **timeline playback** (auto-thinned to a memory budget); interactive "pour water" tool
 
 **Export and projects**
-- PNG screenshot; CSV for gauges / sections / mass balance; ASCII raster export (depth, stage, speed, maxima, arrival time, terrain — with EPSG:3857 georeferencing for online DEMs)
+- PNG screenshot; CSV for gauges / sections / mass balance; ASCII raster export (depth, stage, speed, bed shear stress, maxima, arrival time, terrain — with EPSG:3857 georeferencing for online DEMs)
 - Project files (`.hydrosim.json`) containing the original DEM, imported buildings / land-use rasters and all settings
+
+## Algorithm documentation and verification
+
+[docs/ALGORITHMS.md](docs/ALGORITHMS.md) (Chinese) documents every algorithm the solver uses — governing equations,
+discretisation formulas, the CPU function and GPU kernel that implement each one, and the case that verifies it. The app
+shows the same document under **Help → Algorithm documentation** (rendered with formulas; the 📖 links in the model panel
+jump to the matching section), and **Help → Algorithm verification** runs the verification suite in a background
+thread: 14 cases covering well-balancedness, dam breaks vs. Ritter/Stoker, mass conservation, rainfall-runoff, Manning
+normal depth, Thacker's basin, inertial oscillation, geostrophic balance, wind setup, open-sea boundary radiation and
+inflow, culvert discharge and CPU/GPU parity, each with its metrics, thresholds and an analytical-vs-numerical plot.
+`npm test` runs the same cases with the same thresholds ([tests/verify.test.ts](tests/verify.test.ts)).
 
 ## Built-in cases
 
@@ -92,6 +106,7 @@ WebGPU validation / benchmark page (dev server): <http://127.0.0.1:5173/gpu-test
 | Benchmark | Thacker parabolic basin | analytic solution, moving shoreline |
 | Synthetic | Valley flood routing | triangular hydrograph, floodplain, levees, town (default) |
 | Synthetic | Polder flood-defence operation | 136 buildings, roughness zones, levees; culvert backflow, breach at 2.0 h, pump from 2.5 h, gate drainage at 3.5 h |
+| Synthetic | Ocean currents over seabed topography | 80 km × 50 km sea, 0.4 m/s current past a seamount, island and ridge with a saddle; Coriolis at 30°N, geostrophic initial state, open-sea boundaries, bed shear stress |
 | Synthetic | Storm-surge overtopping | stage boundary, dune gap |
 | Real terrain | Malpasset dam break (France, 1959) | offline-bundled open DEM, 100 m reservoir polygon |
 | Real terrain | Ahr valley flood (Germany, 2021) | open DEM + hourly ERA5 rain + daily GloFAS discharge (offline copy) |
@@ -120,7 +135,7 @@ node scripts/fetch-dem.mjs --name mysite --bbox 103.55,30.97,103.67,31.04 --cell
 ## Usage tips
 
 - View: left-drag pans, right-drag rotates, wheel zooms; Space runs / pauses; Esc leaves the current tool.
-- The left "Model" panel is organised ①–⑧. Boundaries, roughness, culverts / pumps, sources and numerical parameters can be changed while running; initial conditions, buildings and structure lines (which rewrite the computational terrain) reset the simulation.
+- The left "Model" panel is organised ①–⑨. Boundaries, roughness, culverts / pumps, sources, Coriolis / wind and numerical parameters can be changed while running; initial conditions, buildings and structure lines (which rewrite the computational terrain) reset the simulation.
 - Toolbar: gauges, cross-sections (discharge positive to the right of start→end), inflow points, water polygons, roughness zones, building outlines, structure lines, culverts / pumps (click intake then outlet), pour water. Double-click or Enter finishes a polygon / polyline.
 - On grids coarser than 15 m use the "high roughness" building mode; "blocking blocks" need streets at least one cell wide.
 - For real DEMs use 128–384 cells; the open DEM is ~30 m native, finer grids add no detail.
@@ -130,21 +145,23 @@ node scripts/fetch-dem.mjs --name mysite --bbox 103.55,30.97,103.67,31.04 --cell
 
 ```
 hydrosim-web/
+├─ docs/ALGORITHMS.md      algorithm and implementation reference with verification (Chinese; also shown in the app)
 ├─ docs/DESIGN.md          design document (feature comparison, architecture, numerics, data, validation, roadmap; Chinese)
 ├─ public/data/            offline-bundled open data (Malpasset / Ahr DEM, Ahr rainfall and discharge)
 ├─ scripts/fetch-dem.mjs   DEM packing script
 ├─ src/
-│  ├─ core/                solver (roughness field, structure lines, culverts / pumps), rasterisation, hydrographs, analytic solutions, geometry, depression filling — DOM-free and unit-tested
+│  ├─ core/                solver (roughness field, structure lines, culverts / pumps, Coriolis, wind, open-sea boundary), derived quantities, rasterisation, hydrographs, analytic solutions, geometry, depression filling — DOM-free and unit-tested
 │  ├─ gpu/                 WebGPU engine: WGSL compute shaders, batched dispatch, GPU-side recording ring buffer
 │  ├─ worker/              compute Worker, engine interface and CPU engine, message protocol
 │  ├─ dev/                 WebGPU validation and benchmark page (gpu-test.html)
 │  ├─ data/                DEM tiles, imagery, ASC, Open-Meteo, OSM vector tiles, synthetic terrain, built-in cases
 │  ├─ viz/                 Three.js scene, terrain (with overlays), water, particles, markers, picking, colormaps
-│  ├─ ui/                  top bar, model panel, display panel, chart dock, map picker, viewport overlays
+│  ├─ verify/              verification suite shared by the app (worker) and Vitest
+│  ├─ ui/                  top bar, model panel, display panel, chart dock, map picker, viewport overlays, algorithm document viewer, verification dialog
 │  ├─ model.ts             model input builder: effective terrain, Manning field, structures
 │  ├─ app.ts               application controller (state, tools, result store, Worker comms)
 │  └─ io.ts                export and project files
-└─ tests/                  Vitest unit tests (the GPU engine is validated in-browser via gpu-test.html)
+└─ tests/                  Vitest unit tests and the verification suite (the GPU engine is validated in-browser)
 ```
 
 ## Engine performance (Intel Xe-LPG integrated GPU, Chrome 156)
@@ -164,6 +181,7 @@ The full Malpasset dam break (4000 s) finishes in about 5 s on the GPU (~890× r
 - The GPU engine is single precision: millimetre agreement with the CPU engine, relative mass error ~1e-5 for long rainfall runs; point sources must be non-negative.
 - Each frame is read back from the GPU for WebGL rendering (~12 MB/frame at 1M cells); a WebGPU renderer sharing buffers is future work.
 - Structures are grid-aligned "z-lines": weirs and gates are resolved by the shallow-water equations themselves (no empirical weir / gate formulas), so accuracy depends on cell size; gates follow a fixed schedule (no level-based rules); culverts use a simplified orifice formula (no pipe friction, no flap gates); sources, culverts and pumps transfer mass but not momentum.
+- No horizontal turbulence model (e.g. Smagorinsky): wakes and eddies depend on the scheme's numerical dissipation. Rotation uses an f-plane (no β effect); wind is uniform in space. See [docs/ALGORITHMS.md](docs/ALGORITHMS.md) §16 for the full list of known gaps.
 - OSM land-use coverage is incomplete in some regions (base roughness is used there); Manning *n* does not vary with depth.
 - ERA5 / GloFAS are coarse reanalysis / model data and substantially underestimate local extreme rain and flood peaks — they demonstrate the data chain only.
 - Open DEMs contain no river-channel bathymetry; sea depth is approximated by a constant where no bathymetry exists.
