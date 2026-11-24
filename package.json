@@ -36,7 +36,9 @@
   },
   "dependencies": {
     "@mapbox/vector-tile": "^3.0.0",
+    "katex": "^0.19.1",
     "leaflet": "^1.9.4",
+    "marked": "^18.3.0",
     "pbf": "^5.1.2",
     "three": "^0.187.0",
     "uplot": "^1.6.32"

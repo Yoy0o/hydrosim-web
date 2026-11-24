@@ -32,5 +32,8 @@ export const ICONS = {
   building: '<path d="M3 21h18"/><path d="M5 21V10l5-3v14"/><path d="M10 21V4l9 3v14"/><path d="M13 9h3M13 12.5h3M13 16h3"/>',
   levee: '<path d="M2 19h4l4.5-9h3L18 19h4"/><path d="M2 14.5c1.3 0 1.3-1 2.6-1s1.3 1 2.6 1"/><path d="M10.5 10h3"/>',
   link: '<path d="M4 8h4a4 4 0 0 1 4 4 4 4 0 0 0 4 4h4"/><circle cx="4" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M11 6.5l2 1.5-2 1.5"/>',
+  book: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20v3H6.5A2.5 2.5 0 0 1 4 20.5z"/><path d="M8 7h8M8 10.5h6"/>',
+  check: '<path d="M9 11.5l2.2 2.2L15.5 9"/><path d="M12 3l7.5 3v5.5c0 4.5-3.2 8.2-7.5 9.5-4.3-1.3-7.5-5-7.5-9.5V6z"/>',
+  help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.2a2.6 2.6 0 0 1 5 .9c0 1.8-2.5 2.3-2.5 3.9M12 17v.5"/>',
   osm: '<path d="M3 6l6-2.5 6 2.5 6-2.5v14.5L15 20.5 9 18l-6 2.5z"/><path d="M9 3.5V18M15 6v14.5"/>',
 };

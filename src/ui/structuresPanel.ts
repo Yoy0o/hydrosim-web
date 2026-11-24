@@ -5,7 +5,7 @@ import { LANDCOVER_CLASSES } from '../model';
 import type { BuildingsDef, LinkDef, LinkKind, StructureKind, StructureLine } from '../types';
 import { button, checkRow, el, fmt, icon, numInput, numRow, row, select, selectRow } from './dom';
 import { ICONS } from './icons';
-import { deleteBtn, section, seriesEditor, shortUnit, timeUnit, toolBtn, type TimeUnit } from './panelKit';
+import { deleteBtn, docLink, section, seriesEditor, shortUnit, timeUnit, toolBtn, type TimeUnit } from './panelKit';
 
 export const STRUCTURE_LABEL: Record<StructureKind, string> = { levee: '堤防', weir: '堰', gate: '闸门', breach: '溃口' };
 export const LINK_LABEL: Record<LinkKind, string> = { culvert: '涵洞', pump: '泵站' };
@@ -134,6 +134,7 @@ export function roughnessSection(app: App, open: Set<string>, render: () => void
       el('div', { class: 'hint-table' }, ...MANNING_HINTS.map(([a, b]) => el('div', null, el('span', null, a), el('b', null, b)))),
     ),
     el('div', { class: 'muted small' }, '优先级：糙率分区 > 土地利用 > 基础值；建筑物"高糙率"模式再按覆盖率混合。糙率修改即时生效，不重启计算。'),
+    el('div', { class: 'doc-links' }, docLink('s6', '摩阻与底床剪切应力'), docLink('s13', '糙率场的构建')),
   );
   const badge = [`n=${s.manning}`, lc && R.useLandcover ? '土地利用' : null, R.zones.length ? `${R.zones.length} 分区` : null].filter(Boolean).join(' · ');
   return section('rough', '② 糙率与土地利用', open, render, badge, ...parts);
@@ -255,7 +256,10 @@ export function structuresSection(app: App, open: Set<string>, render: () => voi
       ),
     );
   }
-  parts.push(el('div', { class: 'muted small' }, '建筑物与结构线会改写计算地形，修改后模拟从初始状态重新开始；涵洞/泵站参数可在计算中热更新。'));
+  parts.push(
+    el('div', { class: 'muted small' }, '建筑物与结构线会改写计算地形，修改后模拟从初始状态重新开始；涵洞/泵站参数可在计算中热更新。'),
+    docLink('s13', '建筑物与水工结构的算法与实现'),
+  );
 
   const badge = [
     B.mode !== 'off' && ((ob && B.useOsm) || B.items.length) ? (B.mode === 'block' ? '建筑阻水' : '建筑糙率') : null,

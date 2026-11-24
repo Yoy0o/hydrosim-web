@@ -1,6 +1,6 @@
-/** Left panel: model setup tree (terrain, roughness, structures, boundaries, initial conditions, sources, numerics, observers). */
-import type { App } from '../app';
-import type { BoundarySpec, Side } from '../core/solver';
+/** Left panel: model setup tree (terrain, roughness, structures, boundaries, initial conditions, sources, Coriolis/wind, numerics, observers). */
+import type { App, ChangeKind } from '../app';
+import { coriolisParameter, windDragCoefficient, type BoundarySpec, type Side } from '../core/solver';
 import { integrateSeries, seriesMax, triangularHydrograph, type TimeSeries } from '../core/timeseries';
 import { cosLatOf, localToLonLat } from '../data/geo';
 import { dischargeSeriesFromDaily, fetchDailyDischarge, fetchHourlyRain, rainSeriesFromHourly } from '../data/openmeteo';
@@ -9,7 +9,8 @@ import type { EnginePref } from '../worker/protocol';
 import { button, checkRow, el, fmt, fmtVolume, icon, numInput, numRow, row, select, selectRow } from './dom';
 import { ICONS } from './icons';
 import { openMapPicker } from './mapPicker';
-import { section, seriesEditor, timeUnit, toolBtn } from './panelKit';
+import { docLink, section, seriesEditor, timeUnit, toolBtn } from './panelKit';
+import { openVerify } from './verifyDialog';
 import { roughnessSection, structuresSection } from './structuresPanel';
 
 export { timeUnit };
@@ -20,6 +21,7 @@ const BC_TYPES: [BoundarySpec['type'], string][] = [
   ['open', '自由出流'],
   ['level', '水位过程'],
   ['tide', '正弦潮位'],
+  ['ocean', '外海开边界（水位+流速）'],
 ];
 
 function isoDay(offsetDays: number): string {
@@ -90,9 +92,12 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       const b = s.boundaries[side];
       const setB = (nb: BoundarySpec): void => app.update('params', (sc) => (sc.boundaries[side] = nb));
       const typeSel = select(b.type, BC_TYPES, (v) => {
+        const seaLevel = zMin < 0 ? 0 : Math.round((zMin + (zMax - zMin) * 0.1) * 10) / 10;
+        const tide = b.type === 'tide' || b.type === 'ocean' ? b : { mean: seaLevel, amplitude: 0, period: 12.42 * 3600, phase: 0 };
         if (v === 'wall' || v === 'open') setB({ type: v });
-        else if (v === 'level') setB({ type: 'level', series: [[0, Math.round((zMin + (zMax - zMin) * 0.1) * 10) / 10]] });
-        else setB({ type: 'tide', mean: 0, amplitude: 1, period: 12.42 * 3600, phase: 0 });
+        else if (v === 'level') setB({ type: 'level', series: [[0, seaLevel]] });
+        else if (v === 'tide') setB({ type: 'tide', mean: tide.mean, amplitude: tide.amplitude || 1, period: tide.period, phase: tide.phase });
+        else setB({ type: 'ocean', mean: tide.mean, amplitude: tide.amplitude, period: tide.period, phase: tide.phase, u: 0, v: 0 });
       });
       const box = el('div', { class: `bc-row bc-${b.type}` }, el('div', { class: 'bc-head' }, el('span', { class: `dot dot-${b.type}` }), el('span', null, SIDE_LABEL[side]), typeSel));
       if (b.type === 'level') {
@@ -100,17 +105,36 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
           el('div', { class: 'muted small' }, '外部水位（单值即恒定水位）。低于地形处该边界不进水。'),
           seriesEditor(b.series, unit, '水位 (m)', (ser) => setB({ type: 'level', series: ser }), 3),
         );
-      } else if (b.type === 'tide') {
+      } else if (b.type === 'tide' || b.type === 'ocean') {
         box.append(
           numRow('平均水位', b.mean, (v) => setB({ ...b, mean: v }), { unit: 'm', step: 0.1 }),
-          numRow('振幅', b.amplitude, (v) => setB({ ...b, amplitude: v }), { unit: 'm', step: 0.1, min: 0 }),
+          numRow(b.type === 'ocean' ? '潮汐振幅' : '振幅', b.amplitude, (v) => setB({ ...b, amplitude: v }), { unit: 'm', step: 0.1, min: 0 }),
           numRow('周期', b.period / 3600, (v) => setB({ ...b, period: Math.max(0.01, v) * 3600 }), { unit: 'h', step: 0.01, digits: 3 }),
           numRow('初相位', b.phase, (v) => setB({ ...b, phase: v }), { unit: '°', step: 5 }),
         );
+        if (b.type === 'ocean') {
+          box.append(
+            numRow('外海流速 u（东向）', b.u, (v) => setB({ ...b, u: v }), { unit: 'm/s', step: 0.05, digits: 3 }),
+            numRow('外海流速 v（北向）', b.v, (v) => setB({ ...b, v: v }), { unit: 'm/s', step: 0.05, digits: 3 }),
+            el(
+              'div',
+              { class: 'muted small' },
+              '外海水位与流速作为边界外侧的远场状态，由边界黎曼解区分入流与出流，向外传播的波动可无反射离开计算域；启用科氏力时边界水位按外海流的地转平衡倾斜。',
+            ),
+          );
+        }
       }
       bcRows.push(box);
     }
-    const bcSec = section('bc', '④ 边界条件', open, render, null, ...bcRows);
+    const bcSec = section(
+      'bc',
+      '④ 边界条件',
+      open,
+      render,
+      null,
+      ...bcRows,
+      docLink('s8', '边界条件的算法与实现'),
+    );
 
     // ---------------------------------------------------------------- initial conditions
     const ic = s.initial;
@@ -133,6 +157,12 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       ),
     );
     const baseOn = ic.baseLevel !== null;
+    const vel = ic.velocity ?? { u: 0, v: 0 };
+    const setVel = (u: number, v: number): void =>
+      app.update('initial', (sc) => {
+        if (u === 0 && v === 0) delete sc.initial.velocity;
+        else sc.initial.velocity = { u, v };
+      });
     const icSec = section(
       'ic',
       '⑤ 初始条件',
@@ -149,7 +179,14 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
         toolBtn(app, 'region', '绘制水体多边形', ICONS.region),
       ),
       app.tool === 'region' ? el('div', { class: 'tip' }, '在视图中依次单击顶点，双击或回车结束；Esc 取消。') : null,
+      el('div', { class: 'sub-title' }, '初始流速（所有湿网格均匀）'),
+      numRow('u（东向）', vel.u, (v) => setVel(v, vel.v), { unit: 'm/s', step: 0.05, digits: 3 }),
+      numRow('v（北向）', vel.v, (v) => setVel(vel.u, v), { unit: 'm/s', step: 0.05, digits: 3 }),
+      s.physics?.coriolis && (vel.u !== 0 || vel.v !== 0)
+        ? el('div', { class: 'muted small' }, '已启用科氏力：全域初始水位按该流速的地转平衡倾斜（g∂η/∂y = −f·u，g∂η/∂x = f·v），避免启动时激发惯性振荡。')
+        : null,
       el('div', { class: 'muted small' }, '注意：修改初始条件将重置模拟。'),
+      docLink('s14', '初始条件的算法与实现'),
     );
 
     // ---------------------------------------------------------------- sources & rain
@@ -188,6 +225,69 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       app.tool === 'source' ? el('div', { class: 'tip' }, '在视图中单击河道位置放置入流点。') : null,
       el('div', { class: 'sub-title' }, '降雨'),
       rainBox,
+      docLink('s9', '源汇项的算法与实现'),
+    );
+
+    // ---------------------------------------------------------------- Coriolis & wind
+    const ph = s.physics!;
+    const fCor = coriolisParameter(ph.latitude);
+    const wind = ph.wind;
+    const windConst = wind.speed.length === 1;
+    const wMax = seriesMax(wind.speed);
+    const cdMax = windDragCoefficient(wMax);
+    /** With an initial current the Coriolis setting also tilts the initial surface: reset in that case. */
+    const physKind = (): ChangeKind => (s.initial.velocity && (s.initial.velocity.u !== 0 || s.initial.velocity.v !== 0) ? 'initial' : 'params');
+    const physSec = section(
+      'phys',
+      '⑦ 科氏力与风场',
+      open,
+      render,
+      [ph.coriolis ? `${fmt(ph.latitude, 1)}°` : null, wind.enabled ? `风 ${fmt(wMax, 1)} m/s` : null].filter(Boolean).join(' · ') || null,
+      checkRow('科氏力（f 平面近似）', ph.coriolis, (on) => app.update(physKind(), (sc) => (sc.physics!.coriolis = on))),
+      numRow('纬度', ph.latitude, (v) => app.update(physKind(), (sc) => (sc.physics!.latitude = Math.max(-90, Math.min(90, v)))), {
+        unit: '°N',
+        step: 1,
+        digits: 3,
+        title: '南半球为负值；地理坐标地形默认取区域中心纬度',
+      }),
+      el(
+        'div',
+        { class: 'summary' },
+        `f = 2Ω·sinφ = ${fCor.toExponential(3)} s⁻¹${fCor !== 0 ? ` · 惯性周期 ${fmt((2 * Math.PI) / Math.abs(fCor) / 3600, 1)} h` : ''}`,
+      ),
+      el('div', { class: 'muted small' }, '空间尺度大于约 10 km 或历时超过数小时的海洋、河口与大型湖泊过程需考虑科氏力；河道与城市洪水通常可忽略。'),
+      el('div', { class: 'sub-title' }, '风应力（全域均匀风场）'),
+      checkRow('启用风应力', wind.enabled, (on) => app.update('params', (sc) => (sc.physics!.wind.enabled = on))),
+      wind.enabled
+        ? el(
+            'div',
+            { class: 'rain-box' },
+            row(
+              '风速',
+              select(windConst ? 'const' : 'series', [['const', '恒定'], ['series', '过程线']], (v) =>
+                app.update('params', (sc) => {
+                  const d = sc.simulation.duration;
+                  sc.physics!.wind.speed = v === 'const' ? [[0, wMax]] : [[0, 0], [0.25 * d, wMax], [d, wMax]];
+                }),
+              ),
+            ),
+            windConst
+              ? numRow('10 m 风速', wind.speed[0][1], (v) => app.update('params', (sc) => (sc.physics!.wind.speed = [[0, Math.max(0, v)]])), { unit: 'm/s', min: 0, step: 1 })
+              : seriesEditor(wind.speed, unit, '风速 (m/s)', (ser) => app.update('params', (sc) => (sc.physics!.wind.speed = ser)), 4),
+            numRow('风向（来向）', wind.direction, (v) => app.update('params', (sc) => (sc.physics!.wind.direction = ((v % 360) + 360) % 360)), {
+              unit: '°',
+              step: 15,
+              title: '风吹来的方向，从正北顺时针：0 北风，90 东风，180 南风，270 西风',
+            }),
+            el('div', { class: 'summary' }, `Cd = ${(cdMax * 1000).toFixed(2)}×10⁻³（Wu 1982）· 最大风应力 τ = ${fmt(1.225 * cdMax * wMax * wMax, 3)} Pa`),
+          )
+        : null,
+      numRow('水体密度', ph.waterDensity, (v) => app.update('params', (sc) => (sc.physics!.waterDensity = Math.max(900, Math.min(1100, v)))), {
+        unit: 'kg/m³',
+        step: 5,
+        title: '淡水 1000，海水约 1025；影响风应力与底床剪切应力',
+      }),
+      docLink('s7', '科氏力与风应力的算法与实现'),
     );
 
     // ---------------------------------------------------------------- numerics
@@ -195,7 +295,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
     const durUnit = timeUnit(sim.duration);
     const simSec = section(
       'sim',
-      '⑦ 计算设置',
+      '⑧ 计算设置',
       open,
       render,
       `${sim.order === 2 ? '二阶' : '一阶'} · ${app.engineInfo ? (app.engineInfo.kind === 'gpu' ? 'GPU' : 'CPU') : '…'}`,
@@ -242,6 +342,16 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
         title: '用于淹没面积与到达时间统计',
       }),
       el('div', { class: 'muted small' }, '有限体积 HLL 黎曼求解器 + Chen–Noelle 静水重构；隐式曼宁摩阻；CFL 自适应时间步。'),
+      el(
+        'div',
+        { class: 'doc-links' },
+        docLink('s3', '数值通量'),
+        docLink('s4', '静水重构'),
+        docLink('s5', '二阶格式'),
+        docLink('s10', '时间步与干湿'),
+        docLink('s12', 'GPU 实现'),
+      ),
+      button(el('span', null, icon(ICONS.check, 15), ' 运行算法核验…'), () => openVerify(), 'btn small', '在后台线程运行全部算法核验算例（解析解对比、守恒性、GPU 一致性）'),
     );
 
     // ---------------------------------------------------------------- observers
@@ -273,7 +383,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
     );
     const obsSec = section(
       'obs',
-      '⑧ 观测点与断面',
+      '⑨ 观测点与断面',
       open,
       render,
       `${s.probes.length} 点 · ${s.sections.length} 断面`,
@@ -293,6 +403,7 @@ export function buildModelPanel(root: HTMLElement, app: App): void {
       bcSec,
       icSec,
       srcSec,
+      physSec,
       simSec,
       obsSec,
     );

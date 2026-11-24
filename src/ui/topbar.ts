@@ -4,6 +4,8 @@ import { GRID_EXPORTS, exportBalanceCsv, exportGrid, exportProbesCsv, exportScre
 import { button, el, fmtTime, icon, modal, numRow, pickFile } from './dom';
 import { ICONS } from './icons';
 import { openMapPicker } from './mapPicker';
+import { openDocs } from './docViewer';
+import { openVerify } from './verifyDialog';
 
 const SPEEDS: [number, string][] = [
   [0, '最快'],
@@ -122,6 +124,17 @@ export function buildTopbar(root: HTMLElement, app: App): void {
       }, 'btn ghost', '打开工程文件 (.hydrosim.json)'),
       button(el('span', null, icon(ICONS.save, 16), ' 保存'), () => saveProject(app), 'btn ghost', '保存工程（含地形与全部设置）'),
       dropdown(el('span', null, icon(ICONS.download, 16), ' 导出'), exportItems),
+      dropdown(el('span', null, icon(ICONS.help, 16), ' 帮助'), [
+        menuItem('算法与实现文档', () => void openDocs(), '控制方程、离散格式、边界条件、源项、GPU 实现与代码位置'),
+        menuItem('算法核验', () => openVerify(), '解析解对比、守恒性与 GPU 一致性，在后台线程运行'),
+        el('div', { class: 'menu-group' }, '常用章节'),
+        menuItem('§3 数值通量（HLL）', () => void openDocs('s3')),
+        menuItem('§4 静水重构与底坡源项', () => void openDocs('s4')),
+        menuItem('§7 科氏力与风应力', () => void openDocs('s7')),
+        menuItem('§8 边界条件', () => void openDocs('s8')),
+        menuItem('§15 核验清单', () => void openDocs('s15')),
+        menuItem('§16 算法审查与改进记录', () => void openDocs('s16')),
+      ]),
     ),
     caseName,
     el('div', { class: 'tb-run' }, playBtn, stepBtn, resetBtn, speedSel, engBadge, el('div', { class: 'tb-timebox' }, timeTxt, prog)),

@@ -2,6 +2,7 @@
 import type { App, Tool } from '../app';
 import { parseSeriesText, seriesToText, type TimeSeries } from '../core/timeseries';
 import { button, el, icon } from './dom';
+import { openDocs } from './docViewer';
 import { ICONS } from './icons';
 
 export interface TimeUnit {
@@ -73,4 +74,22 @@ export function deleteBtn(onDelete: () => void): HTMLButtonElement {
     'icon-btn',
     '删除',
   );
+}
+
+/** Link to a section of the algorithm document (docs/ALGORITHMS.md, opened in the in-app viewer). */
+export function docLink(anchor: string, label: string): HTMLButtonElement {
+  return el(
+    'button',
+    {
+      class: 'doc-link',
+      type: 'button',
+      title: '在算法文档中查看对应章节（公式、实现位置与核验方法）',
+      onclick: (e: Event) => {
+        e.stopPropagation();
+        void openDocs(anchor);
+      },
+    },
+    icon(ICONS.book, 13),
+    ` ${label}`,
+  ) as HTMLButtonElement;
 }

@@ -1,5 +1,6 @@
 /** Overlays on the 3D viewport: tool palette, view buttons, legend, HUD, playback bar, busy overlay, toasts, status bar. */
 import type { App, Tool } from '../app';
+import { bedShear } from '../core/derived';
 import { exportScreenshot } from '../io';
 import { COLOR_MODES, colormapCss } from '../viz/colormaps';
 import { button, el, fmt, fmtTime, icon, kids } from './dom';
@@ -225,6 +226,14 @@ export function buildToasts(app: App): void {
 }
 
 export function buildStatusbar(root: HTMLElement, app: App): void {
+  /** Bed shear stress at the hovered cell (Manning law, model n and water density). */
+  const shearAt = (h: { x: number; y: number; h: number; u: number; v: number }): number => {
+    const t = app.terrain;
+    if (!t) return 0;
+    const i = Math.min(t.nx - 1, Math.max(0, Math.floor(h.x / t.dx)));
+    const j = Math.min(t.ny - 1, Math.max(0, Math.floor(h.y / t.dy)));
+    return bedShear(app.scenario?.physics?.waterDensity ?? 1000, 9.81, app.manningAt(j * t.nx + i), h.h, h.u, h.v);
+  };
   const cursor = el('span', { class: 'sb-cursor' });
   const grid = el('span', { class: 'sb-grid' });
   const perf = el('span', { class: 'sb-perf' });
@@ -244,6 +253,7 @@ export function buildStatusbar(root: HTMLElement, app: App): void {
       wet ? `水位 ${fmt(h.z + h.h, 2)} m` : '',
       wet ? `流速 ${fmt(spd, 2)} m/s` : '',
       wet ? `Fr ${fmt(spd / Math.sqrt(9.81 * Math.max(h.h, 1e-6)), 2)}` : '',
+      wet ? `τb ${fmt(shearAt(h), 2)} Pa` : '',
     ].filter(Boolean);
     cursor.textContent = parts.join('  ·  ');
   });
