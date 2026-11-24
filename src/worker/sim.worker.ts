@@ -212,6 +212,8 @@ async function startEngine(msg: InitMessage, pref: EnginePref): Promise<void> {
     grid: msg.grid,
     z: msg.z,
     h0: msg.h0,
+    hu0: msg.hu0,
+    hv0: msg.hv0,
     params: msg.params,
     recordInterval: msg.recordInterval,
     probes: msg.probes,
@@ -271,8 +273,8 @@ async function handle(msg: MainToWorker): Promise<void> {
       if (!engine || !init) return;
       await stopLoop();
       const e = engine;
-      const h0 = init.h0;
-      await exclusive(async () => e.setState(h0));
+      const i0 = init;
+      await exclusive(async () => e.setState(i0.h0, i0.hu0, i0.hv0));
       resetCommon();
       await sendFrame(true, true);
       await sendOutput();
@@ -283,10 +285,10 @@ async function handle(msg: MainToWorker): Promise<void> {
     case 'setDepth': {
       if (!engine || !init) return;
       await stopLoop();
-      init = { ...init, h0: msg.h };
+      init = { ...init, h0: msg.h, hu0: msg.hu ?? null, hv0: msg.hv ?? null };
       const e = engine;
-      const h0 = msg.h;
-      await exclusive(async () => e.setState(h0));
+      const m = msg;
+      await exclusive(async () => e.setState(m.h, m.hu ?? null, m.hv ?? null));
       resetCommon();
       await sendFrame(true, true);
       await sendOutput();

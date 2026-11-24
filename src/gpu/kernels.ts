@@ -9,6 +9,7 @@
  * Time stepping is fully GPU-resident: interface kernels reduce the maximum wave speed with atomics, a
  * one-thread "scalar" kernel computes dt, source integrals and boundary levels, and records are written
  * to a ring buffer through indirect dispatches. The CPU only encodes batches and reads results back.
+ * Kernel-by-kernel mapping to the CPU solver: docs/ALGORITHMS.md §12.
  */
 
 export const COMMON = /* wgsl */ `
@@ -22,6 +23,10 @@ struct Params {
   bcType: vec4<u32>,
   stepsInBatch: u32, nProbes: u32, nSections: u32, recFloats: u32,
   nSources: u32, forceLast: u32, statsGroups: u32, nLines: u32,
+  fcor: f32, windOn: u32, windDirX: f32, windDirY: f32,
+  bcVelA: vec4<f32>,
+  bcVelB: vec4<f32>,
+  rhoRatio: f32, windMinH: f32, padA: f32, padB: f32,
 }
 
 struct Ctrl {
@@ -45,16 +50,17 @@ struct Ctrl {
   srcVol: array<f32, 64>,
   linkVol: array<f32, 16>,
   lineCrest: array<f32, 16>,
+  wind: vec4<f32>,
 }
 `;
 
 /** Byte size / offsets of Ctrl (must match the WGSL struct). */
-export const CTRL_BYTES = 464;
+export const CTRL_BYTES = 480;
 export const CTRL_LEVELS_OFFSET = 64;
 export const CTRL_LINECREST_OFFSET = 400;
 export const MAX_LINKS = 16;
 export const MAX_LINES = 16;
-export const PARAMS_BYTES = 144;
+export const PARAMS_BYTES = 208;
 export const MAX_SOURCES = 64;
 export const REC_HEADER = 16;
 
@@ -91,9 +97,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let a = U[p0];
   let b = U[p1];
   let cfg = P.bcType[side];
-  // bed ghosts: walls mirror the bed, open/level boundaries copy the boundary cell
-  let z1 = a.w;
-  let z2 = select(a.w, b.w, cfg == 0u);
+  // bed ghosts: walls mirror the bed, level/tide/open-sea boundaries copy the boundary cell, free outflow
+  // continues a downhill bed (normal-depth assumption; a flat continuation acts as a pool at the outlet)
+  var z1 = a.w;
+  var z2 = select(a.w, b.w, cfg == 0u);
+  if (cfg == 1u && p1 != p0) {
+    let drop = max(0.0, b.w - a.w);
+    z1 = a.w - drop;
+    z2 = a.w - 2.0 * drop;
+  }
   var code = cfg;
   // free outflow is outflow-only: reflective while the boundary cell flows inwards
   let qn = select(a.z, a.y, axisX);
@@ -109,6 +121,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (code == 1u) {
     U[g1] = vec4<f32>(a.xyz, z1);
     U[g2] = vec4<f32>(a.xyz, z2);
+    return;
+  }
+  if (code == 3u) {
+    // open sea: far-field state (external level + geostrophic tilt, external current) of the boundary Riemann problem
+    var vel = P.bcVelA.xy;
+    if (side == 1u) { vel = P.bcVelA.zw; } else if (side == 2u) { vel = P.bcVelB.xy; } else if (side == 3u) { vel = P.bcVelB.zw; }
+    let Lx = f32(nx) * P.dx;
+    let Ly = f32(ny) * P.dy;
+    var bx = 0.0;
+    var by = 0.0;
+    if (side == 0u) { by = (f32(k) + 0.5) * P.dy; }
+    else if (side == 1u) { bx = Lx; by = (f32(k - ny) + 0.5) * P.dy; }
+    else if (side == 2u) { bx = (f32(k - 2u * ny) + 0.5) * P.dx; }
+    else { bx = (f32(k - 2u * ny - nx) + 0.5) * P.dx; by = Ly; }
+    var lvl = C.levels[side];
+    if (P.fcor != 0.0) { lvl = lvl + (P.fcor / P.g) * (vel.y * (bx - 0.5 * Lx) - vel.x * (by - 0.5 * Ly)); }
+    var ho = lvl - z1;
+    if (!(ho > P.hDry)) { ho = 0.0; }
+    U[g1] = vec4<f32>(ho, ho * vel, z1);
+    U[g2] = vec4<f32>(ho, ho * vel, z2);
     return;
   }
   // water level boundary: far-field reservoir, velocity extrapolated when the interior is wet
@@ -452,9 +484,18 @@ fn main() {
   }
   var lv = C.levels;
   for (var sd = 0u; sd < 4u; sd = sd + 1u) {
-    if (P.bcType[sd] == 2u) { lv[sd] = sampleRef(1u + sd, t1); }
+    if (P.bcType[sd] >= 2u) { lv[sd] = sampleRef(1u + sd, t1); }
   }
   C.levels = lv;
+  // kinematic wind stress (Wu 1982 drag, capped) at mid-step; series ref after the lines
+  var wnd = vec4<f32>(0.0);
+  if (P.windOn != 0u && dt > 0.0) {
+    let W = max(0.0, sampleRef(5u + P.nSources + P.nLinks + P.nLines, t0 + 0.5 * dt));
+    let cd = min(2.5e-3, (0.8 + 0.065 * W) * 1e-3);
+    let sw = P.rhoRatio * cd * W * W;
+    wnd = vec4<f32>(sw * P.windDirX, sw * P.windDirY, W, cd);
+  }
+  C.wind = wnd;
   C.dt = dt;
   C.halted = halted;
   let tr = C.tRel + dt;
@@ -522,8 +563,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /**
  * Conservative update. STAGE 0: first-order full step; 1: Heun stage 1 (U += dt L); 2: Heun stage 2
- * (U = (U0 + U + dt L)/2). Final stages add point sources, rain, infiltration, implicit friction,
- * velocity cap, clipping accounting and the result envelopes.
+ * (U = (U0 + U + dt L)/2). Final stages add point sources, links, rain, infiltration, wind stress, implicit
+ * friction, velocity cap, Coriolis rotation, clipping accounting and the result envelopes.
  */
 export const UPDATE = /* wgsl */ `
 ${COMMON}
@@ -538,6 +579,18 @@ override STAGE: u32 = 0u;
 @group(0) @binding(7) var<storage, read_write> ACC: array<vec2<f32>>;
 @group(0) @binding(8) var<storage, read> SRCP: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read> NMAN: array<f32>;
+
+/** Implicit Manning friction over dt on a provisional state: momentum scale factor (1 = none). */
+fn frictionScale(hh: f32, qx: f32, qy: f32, c: u32, dt: f32) -> f32 {
+  if (!(hh > P.hDry)) { return 1.0; }
+  let q = sqrt(qx * qx + qy * qy);
+  if (!(q > 0.0)) { return 1.0; }
+  let nm = NMAN[c];
+  let n2g = P.g * nm * nm;
+  if (!(n2g > 0.0)) { return 1.0; }
+  let a = dt * n2g / (hh * hh * pow(hh, 1.0 / 3.0));
+  return 2.0 / (1.0 + sqrt(1.0 + 4.0 * a * q));
+}
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -574,15 +627,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var hn: f32;
   var qx: f32;
   var qy: f32;
+  // Heun stages apply the implicit friction inside each stage (IMEX SSP-RK2, exact for uniform flow)
   if (STAGE == 2u) {
     let o = U0[p];
-    hn = 0.5 * (o.x + u.x + dt * dh);
-    qx = 0.5 * (o.y + u.y + dt * dqx);
-    qy = 0.5 * (o.z + u.z + dt * dqy);
+    let wh = u.x + dt * dh;
+    var wx = u.y + dt * dqx;
+    var wy = u.z + dt * dqy;
+    let rf = frictionScale(wh, wx, wy, c, dt);
+    wx = wx * rf;
+    wy = wy * rf;
+    hn = 0.5 * (o.x + wh);
+    qx = 0.5 * (o.y + wx);
+    qy = 0.5 * (o.z + wy);
   } else {
     hn = u.x + dt * dh;
     qx = u.y + dt * dqx;
     qy = u.z + dt * dqy;
+    if (STAGE == 1u) {
+      let rf = frictionScale(hn, qx, qy, c, dt);
+      qx = qx * rf;
+      qy = qy * rf;
+    }
   }
   var acc = ACC[c];
   if (hn < 0.0) {
@@ -638,11 +703,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     qx = 0.0; qy = 0.0;
     if (hn < 0.0) { acc.y = acc.y - hn; hn = 0.0; }
   } else {
+    if (P.windOn != 0u && hn > P.windMinH) {
+      qx = qx + dt * C.wind.x;
+      qy = qy + dt * C.wind.y;
+    }
     var q = sqrt(qx * qx + qy * qy);
     if (q > 0.0) {
       let nm = NMAN[c];
       let n2g = P.g * nm * nm;
-      if (n2g > 0.0) {
+      if (STAGE == 0u && n2g > 0.0) {
         let a = dt * n2g / (hn * hn * pow(hn, 1.0 / 3.0));
         let qn = 2.0 * q / (1.0 + sqrt(1.0 + 4.0 * a * q));
         let r = qn / q;
@@ -651,6 +720,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (P.vcap > 0.0 && q > P.vcap * hn) {
         let r = P.vcap * hn / q;
         qx = qx * r; qy = qy * r; q = P.vcap * hn;
+      }
+      if (P.fcor != 0.0) {
+        // Coriolis: clockwise rotation by f dt (northern hemisphere); renormalised because cos(f dt)
+        // rounds to 1 in f32 and the bare rotation would slowly inflate |q|
+        let th = P.fcor * dt;
+        let cs = cos(th);
+        let sn = sin(th);
+        let rx = cs * qx + sn * qy;
+        let ry = cs * qy - sn * qx;
+        let m = sqrt(rx * rx + ry * ry);
+        if (m > 0.0) { qx = rx * (q / m); qy = ry * (q / m); }
       }
     }
     var e = ENV[c];

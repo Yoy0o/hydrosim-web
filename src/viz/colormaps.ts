@@ -105,6 +105,8 @@ export interface ModeInfo {
   envelope?: boolean;
   /** shader mode index */
   shader: number;
+  /** Per-cell value computed on the CPU from the displayed state (uploaded as the aux texture). */
+  derived?: boolean;
 }
 
 export const COLOR_MODES: Record<ColorMode, ModeInfo> = {
@@ -114,6 +116,7 @@ export const COLOR_MODES: Record<ColorMode, ModeInfo> = {
   wse: { label: '水位 η', unit: 'm', defaultMap: 'viridis', shader: 3 },
   froude: { label: '弗劳德数 Fr', unit: '', defaultMap: 'turbo', fixed: [0, 2], shader: 4 },
   hazard: { label: '危险度 h(V+0.5)', unit: 'm²/s', defaultMap: 'hazard', fixed: [0, 2.5], shader: 5 },
+  shear: { label: '底床剪切应力 τb', unit: 'Pa', defaultMap: 'magma', shader: 6, derived: true },
   maxDepth: { label: '最大水深（包络）', unit: 'm', defaultMap: 'blues', envelope: true, shader: 6 },
   maxSpeed: { label: '最大流速（包络）', unit: 'm/s', defaultMap: 'turbo', envelope: true, shader: 6 },
   maxHazard: { label: '最大危险度（包络）', unit: 'm²/s', defaultMap: 'hazard', fixed: [0, 2.5], envelope: true, shader: 6 },

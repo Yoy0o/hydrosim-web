@@ -5,7 +5,7 @@
 import { cellOf, polygonCells, rasterizeLine, rasterizeRings, type GridGeom } from './core/raster';
 import { lineBed, type DynamicLineSpec, type LinkSpec } from './core/solver';
 import { sampleSeries, type TimeSeries } from './core/timeseries';
-import type { BuildingsDef, RoughnessDef, Scenario, StructureLine, Terrain } from './types';
+import type { BuildingsDef, PhysicsDef, RoughnessDef, Scenario, StructureLine, Terrain } from './types';
 
 /** Building footprints rasterised at 4 x 4 sub-samples per cell. */
 export interface BuildingRaster {
@@ -76,8 +76,16 @@ export function defaultBuildings(): BuildingsDef {
   return { mode: 'block', defaultHeight: 10, n: 0.3, useOsm: true, items: [] };
 }
 
-/** Fill optional scenario sections (older project files / presets). */
-export function ensureScenarioDefaults(sc: Scenario): Scenario {
+export function defaultPhysics(latitude = 30): PhysicsDef {
+  return { coriolis: false, latitude, wind: { enabled: false, speed: [[0, 10]], direction: 270 }, waterDensity: 1000 };
+}
+
+/** Fill optional scenario sections (older project files / presets); terrain gives the default latitude. */
+export function ensureScenarioDefaults(sc: Scenario, terrain?: Terrain): Scenario {
+  if (!sc.physics) {
+    const g = terrain?.georef;
+    sc.physics = defaultPhysics(g && g.kind === 'mercator' ? Math.round(((g.south + g.north) / 2) * 100) / 100 : 30);
+  }
   if (!sc.roughness) sc.roughness = defaultRoughness();
   for (const c of LANDCOVER_CLASSES.slice(1)) if (sc.roughness.table[c.key] === undefined) sc.roughness.table[c.key] = c.n;
   if (!sc.buildings) sc.buildings = defaultBuildings();

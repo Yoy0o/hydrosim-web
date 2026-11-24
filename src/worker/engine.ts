@@ -50,6 +50,9 @@ export interface EngineInit {
   grid: GridSpec;
   z: Float32Array;
   h0: Float32Array;
+  /** Initial unit discharges hu, hv (interior, row-major); zero when absent. */
+  hu0?: Float32Array | null;
+  hv0?: Float32Array | null;
   params: SolverParams;
   recordInterval: number;
   probes: ProbeSpec[];
@@ -61,8 +64,8 @@ export interface Engine {
   readonly label: string;
   readonly t: number;
   readonly stepCount: number;
-  /** Reset to an initial depth (interior, row-major); clears clocks, accumulators and envelopes. */
-  setState(h0: Float32Array): void;
+  /** Reset to an initial state (interior, row-major); clears clocks, accumulators and envelopes. */
+  setState(h0: Float32Array, hu0?: Float32Array | null, hv0?: Float32Array | null): void;
   setParams(p: Partial<SolverParams>): void;
   setExtraSources(s: SourceSpec[]): void;
   setObservers(probes: ProbeSpec[], sections: SectionSpec[]): void;
@@ -95,7 +98,7 @@ export class CpuEngine implements Engine {
     this.probes = init.probes;
     this.sections = init.sections;
     this.recordInterval = init.recordInterval;
-    this.setState(init.h0);
+    this.setState(init.h0, init.hu0, init.hv0);
   }
 
   get t(): number {
@@ -105,8 +108,8 @@ export class CpuEngine implements Engine {
     return this.solver.stepCount;
   }
 
-  setState(h0: Float32Array): void {
-    this.solver.setState(h0);
+  setState(h0: Float32Array, hu0?: Float32Array | null, hv0?: Float32Array | null): void {
+    this.solver.setState(h0, hu0, hv0);
     this.solver.setExtraSources([]);
     this.nextRecord = this.recordInterval;
   }

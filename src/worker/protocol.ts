@@ -71,6 +71,9 @@ export interface InitMessage {
   grid: GridSpec;
   z: Float32Array;
   h0: Float32Array;
+  /** Initial unit discharges (optional, zero when absent). */
+  hu0?: Float32Array | null;
+  hv0?: Float32Array | null;
   params: SolverParams;
   duration: number;
   outputInterval: number;
@@ -92,7 +95,7 @@ export type MainToWorker =
   | { type: 'ack' }
   | { type: 'envelopes' }
   | { type: 'pour'; x: number; y: number; radius: number; rate: number }
-  | { type: 'setDepth'; h: Float32Array }
+  | { type: 'setDepth'; h: Float32Array; hu?: Float32Array | null; hv?: Float32Array | null }
   | { type: 'engine'; pref: EnginePref };
 
 export type WorkerToMain = { epoch?: number } & (

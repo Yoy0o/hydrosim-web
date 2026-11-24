@@ -1,7 +1,8 @@
 /** Application controller: scenario state, simulation worker, 3D layers, tools and result stores. */
 import * as THREE from 'three';
-import { lineBed, type SolverParams } from './core/solver';
+import { coriolisParameter, geostrophicTilt, lineBed, type SolverParams } from './core/solver';
 import { sampleSeries } from './core/timeseries';
+import { bedShearField } from './core/derived';
 import { initialDepth, sectionCells } from './core/geometry';
 import { fillDepressions } from './core/hydro';
 import { BASEMAPS, loadBasemap } from './data/basemap';
@@ -174,7 +175,7 @@ export class App {
   loadCase(c: LoadedCase, keepView = false): void {
     this.pauseIfRunning();
     this.baseTerrain = c.terrain;
-    this.scenario = ensureScenarioDefaults(c.scenario);
+    this.scenario = ensureScenarioDefaults(c.scenario, c.terrain);
     this.aux = { buildings: c.buildings ?? null, landcover: c.landcover ?? null };
     this.initialOverride = c.initialDepth ?? null;
     if (!keepView) this.view = { ...defaultView(), ...(c.scenario.view ?? {}) };
@@ -438,6 +439,11 @@ export class App {
       manningField: this.model?.manning ?? null,
       lines: this.model?.lines ?? [],
       links: this.model?.links ?? [],
+      coriolis: s.physics?.coriolis ? coriolisParameter(s.physics.latitude) : 0,
+      wind:
+        s.physics?.wind.enabled
+          ? { speed: s.physics.wind.speed, direction: s.physics.wind.direction, densityRatio: 1.225 / Math.max(500, s.physics.waterDensity) }
+          : null,
     };
   }
 
@@ -450,7 +456,30 @@ export class App {
     const t = this.terrain!;
     if (this.initialOverride) return this.initialOverride.slice();
     const s = this.scenario!;
-    return initialDepth(t, s.initial.baseLevel, s.initial.regions);
+    // with rotation, an initial current starts in geostrophic balance: the base level carries its tilt
+    const vel = s.initial.velocity;
+    const f = s.physics?.coriolis ? coriolisParameter(s.physics.latitude) : 0;
+    const Lx = t.nx * t.dx;
+    const Ly = t.ny * t.dy;
+    const tilt = f !== 0 && vel && (vel.u !== 0 || vel.v !== 0) ? (x: number, y: number) => geostrophicTilt(f, 9.81, vel.u, vel.v, x, y, Lx / 2, Ly / 2) : undefined;
+    return initialDepth(t, s.initial.baseLevel, s.initial.regions, tilt);
+  }
+
+  /** Initial depth and unit discharges (uniform initial current in wet cells, if set). */
+  computeInitialState(): { h: Float32Array; hu: Float32Array | null; hv: Float32Array | null } {
+    const h = this.computeInitialDepth();
+    const vel = this.scenario!.initial.velocity;
+    if (!vel || (vel.u === 0 && vel.v === 0)) return { h, hu: null, hv: null };
+    const hu = new Float32Array(h.length);
+    const hv = new Float32Array(h.length);
+    const hd = this.scenario!.simulation.hDry;
+    for (let k = 0; k < h.length; k++) {
+      if (h[k] > hd) {
+        hu[k] = h[k] * vel.u;
+        hv[k] = h[k] * vel.v;
+      }
+    }
+    return { h, hu, hv };
   }
 
   private observerSpecs() {
@@ -472,10 +501,13 @@ export class App {
     const t = this.terrain!;
     const s = this.scenario!;
     const obs = this.observerSpecs();
+    const st = this.computeInitialState();
     this.sim.init({
       grid: { nx: t.nx, ny: t.ny, dx: t.dx, dy: t.dy },
       z: t.z.slice(),
-      h0: this.computeInitialDepth(),
+      h0: st.h,
+      hu0: st.hu,
+      hv0: st.hv,
       params: this.solverParams(),
       duration: s.simulation.duration,
       outputInterval: s.simulation.outputInterval,
@@ -618,7 +650,8 @@ export class App {
       this.updateAttribution();
     } else if (kind === 'initial') {
       this.initialOverride = null;
-      this.sim.setDepth(this.computeInitialDepth());
+      const st = this.computeInitialState();
+      this.sim.setDepth(st.h, st.hu, st.hv);
       this.finished = false;
       this.running = false;
       this.emit('simstate');
@@ -679,6 +712,9 @@ export class App {
     }
     if (patch.basemap !== undefined && patch.basemap !== prev.basemap) void this.loadBasemapTexture(v.basemap);
     if (patch.terrainOverlay !== undefined && patch.terrainOverlay !== prev.terrainOverlay) this.updateOverlay();
+    // derived colour modes (bed shear stress) are computed from the displayed state: upload it now,
+    // otherwise a paused run would keep showing the previous auxiliary field
+    if (patch.colorMode !== undefined && patch.colorMode !== prev.colorMode) this.applyState();
     this.applyStyle(true);
     this.emit('view');
   }
@@ -723,6 +759,7 @@ export class App {
       const s = this.displayed();
       if (!s) return;
       this.waterLayer.update(s.h, s.u, s.v, t.z);
+      if (info.derived) this.waterLayer.setAux(this.shearField(s));
       this.particles.setField(s.h, s.u, s.v, Math.max(0.5, (this.stats?.maxV ?? 1) * 0.6));
     }
     const now = performance.now();
@@ -731,6 +768,19 @@ export class App {
       this.computeAutoRange();
       this.applyStyle(false);
     }
+  }
+
+  private shearBuf: Float32Array | null = null;
+  /** Bed shear stress (Pa) of a state, with the model Manning field and the water density (§6.3). */
+  shearField(s: { h: Float32Array; u: Float32Array; v: Float32Array }): Float32Array {
+    const sc = this.scenario!;
+    this.shearBuf = bedShearField(s.h, s.u, s.v, sc.manning, this.model?.manning ?? null, sc.physics?.waterDensity ?? 1000, this.shearBuf ?? undefined);
+    return this.shearBuf;
+  }
+
+  /** Manning n at a cell (field or uniform). */
+  manningAt(c: number): number {
+    return this.model?.manning ? this.model.manning[c] : (this.scenario?.manning ?? 0);
   }
 
   computeAutoRange(): void {
@@ -769,6 +819,10 @@ export class App {
       const sp = new Float32Array(s.h.length);
       for (let k = 0; k < sp.length; k++) sp[k] = Math.hypot(s.u[k], s.v[k]);
       const [, hi] = robustRange(sp, (k) => s.h[k] >= thr, 0, 0.98);
+      this.range = [0, niceCeil(hi)];
+    } else if (mode === 'shear') {
+      const tau = this.shearField(s);
+      const [, hi] = robustRange(tau, (k) => s.h[k] >= thr, 0, 0.98);
       this.range = [0, niceCeil(hi)];
     } else if (mode === 'wse') {
       const w = new Float32Array(s.h.length);

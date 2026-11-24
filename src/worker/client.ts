@@ -25,6 +25,8 @@ export class SimClient {
     grid: GridSpec;
     z: Float32Array;
     h0: Float32Array;
+    hu0?: Float32Array | null;
+    hv0?: Float32Array | null;
     params: SolverParams;
     duration: number;
     outputInterval: number;
@@ -34,7 +36,10 @@ export class SimClient {
     engine: EnginePref;
   }): void {
     this.epoch++;
-    this.send({ type: 'init', epoch: this.epoch, ...o }, [o.z.buffer, o.h0.buffer]);
+    const tr: Transferable[] = [o.z.buffer, o.h0.buffer];
+    if (o.hu0) tr.push(o.hu0.buffer);
+    if (o.hv0) tr.push(o.hv0.buffer);
+    this.send({ type: 'init', epoch: this.epoch, ...o }, tr);
   }
   run(): void {
     this.send({ type: 'run' });
@@ -69,7 +74,10 @@ export class SimClient {
   setEngine(pref: EnginePref): void {
     this.send({ type: 'engine', pref });
   }
-  setDepth(h: Float32Array): void {
-    this.send({ type: 'setDepth', h }, [h.buffer]);
+  setDepth(h: Float32Array, hu?: Float32Array | null, hv?: Float32Array | null): void {
+    const tr: Transferable[] = [h.buffer];
+    if (hu) tr.push(hu.buffer);
+    if (hv) tr.push(hv.buffer);
+    this.send({ type: 'setDepth', h, hu, hv }, tr);
   }
 }

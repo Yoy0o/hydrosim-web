@@ -67,12 +67,13 @@ export function exportBalanceCsv(app: App): void {
   download(`${baseName(app)}_mass_balance_${stamp()}.csv`, lines.join('\n'), 'text/csv');
 }
 
-export type GridExport = 'terrain' | 'depth' | 'wse' | 'speed' | 'maxDepth' | 'maxSpeed' | 'maxHazard' | 'arrival';
+export type GridExport = 'terrain' | 'depth' | 'wse' | 'speed' | 'shear' | 'maxDepth' | 'maxSpeed' | 'maxHazard' | 'arrival';
 
 export const GRID_EXPORTS: [GridExport, string][] = [
   ['depth', '当前水深 (m)'],
   ['wse', '当前水位 (m)'],
   ['speed', '当前流速 (m/s)'],
+  ['shear', '当前底床剪切应力 (Pa)'],
   ['maxDepth', '最大水深包络 (m)'],
   ['maxSpeed', '最大流速包络 (m/s)'],
   ['maxHazard', '最大危险度 h(V+0.5)'],
@@ -90,7 +91,11 @@ export function exportGrid(app: App, what: GridExport): void {
   let vals: Float32Array;
   let valid: (v: number, k: number) => boolean = () => true;
   if (what === 'terrain') vals = t.z;
-  else if (what === 'depth' || what === 'wse' || what === 'speed') {
+  else if (what === 'shear') {
+    if (!s) return app.toast('暂无结果', 'info');
+    vals = app.shearField(s).slice();
+    valid = (_, k) => s.h[k] >= thr;
+  } else if (what === 'depth' || what === 'wse' || what === 'speed') {
     if (!s) return app.toast('暂无结果', 'info');
     vals = new Float32Array(n);
     for (let k = 0; k < n; k++) vals[k] = what === 'depth' ? s.h[k] : what === 'wse' ? s.h[k] + t.z[k] : Math.hypot(s.u[k], s.v[k]);

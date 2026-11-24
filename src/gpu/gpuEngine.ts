@@ -6,7 +6,7 @@
  * After each batch the CPU reads back the control block, the per-step dt history (summed in double
  * precision to keep simulation time exact), the records and optionally the fields for rendering.
  */
-import { boundaryLevel, SIDES, type SolverParams, type SourceSpec } from '../core/solver';
+import { boundaryLevel, SIDES, WIND_MIN_DEPTH, type BoundarySpec, type SolverParams, type SourceSpec } from '../core/solver';
 import { sampleSeries } from '../core/timeseries';
 import type { ProbeSpec, RecordRow, SectionSpec } from '../worker/protocol';
 import type { AdvanceResult, Engine, EngineInit, EngineStats, EnvelopeData, Fields } from '../worker/engine';
@@ -131,7 +131,7 @@ export class GpuEngine implements Engine {
     dev.lost.then((info) => {
       this.lostReason = info.message || 'GPU 设备丢失';
     });
-    this.setState(init.h0);
+    this.setState(init.h0, init.hu0, init.hv0);
   }
 
   /** Request a device, compile all pipelines and upload the initial state. */
@@ -194,8 +194,9 @@ export class GpuEngine implements Engine {
   }
 
   // ------------------------------------------------------------------ configuration
-  setState(h0: Float32Array): void {
+  setState(h0: Float32Array, hu0?: Float32Array | null, hv0?: Float32Array | null): void {
     this.h0 = h0;
+    const hd = this.params.hDry;
     const { nx, ny, NX, N } = this;
     const U = new Float32Array(4 * N);
     const env = new Float32Array(4 * this.nCells);
@@ -207,6 +208,10 @@ export class GpuEngine implements Engine {
         const p = (j + 2) * NX + i + 2;
         const h = Math.max(0, h0[c]);
         U[4 * p] = h;
+        if (h > hd) {
+          if (hu0) U[4 * p + 1] = hu0[c];
+          if (hv0) U[4 * p + 2] = hv0[c];
+        }
         U[4 * p + 3] = this.z[c];
         vol += h;
         env[4 * c] = h;
@@ -232,7 +237,7 @@ export class GpuEngine implements Engine {
 
   setParams(p: Partial<SolverParams>): void {
     this.params = { ...this.params, ...p };
-    if (p.boundaries || p.sources || p.rainfall || p.links || p.lines) this.dirtySeries = true;
+    if (p.boundaries || p.sources || p.rainfall || p.links || p.lines || p.wind !== undefined) this.dirtySeries = true;
     if (p.manning !== undefined || p.manningField !== undefined) this.dirtyManning = true;
   }
 
@@ -273,8 +278,11 @@ export class GpuEngine implements Engine {
     for (const side of SIDES) {
       const b = P.boundaries[side];
       if (b.type === 'level') refs.push({ data: flatten(b.series), mode: 0, n: b.series.length });
-      else if (b.type === 'tide') refs.push({ data: [b.mean, b.amplitude, b.period, b.phase], mode: 2, n: 2 });
-      else refs.push({ data: [], mode: 0, n: 0 });
+      else if (b.type === 'tide' || b.type === 'ocean') {
+        // sinusoid (mean, amplitude, period, phase); a missing period means a constant level
+        const ok = b.amplitude !== 0 && b.period > 0;
+        refs.push({ data: [b.mean, ok ? b.amplitude : 0, ok ? b.period : 1, b.phase], mode: 2, n: 2 });
+      } else refs.push({ data: [], mode: 0, n: 0 });
     }
     const sources = [...P.sources, ...this.extra].slice(0, K.MAX_SOURCES - K.MAX_LINKS);
     for (const s of sources) refs.push({ data: flatten(s.series), mode: 0, n: s.series.length });
@@ -282,6 +290,8 @@ export class GpuEngine implements Engine {
     for (const L of links) refs.push(L.kind === 'pump' ? { data: flatten(L.series), mode: 0, n: L.series.length } : { data: [], mode: 0, n: 0 });
     const lines = P.lines.slice(0, K.MAX_LINES);
     for (const L of lines) refs.push({ data: flatten(L.series), mode: 0, n: L.series.length });
+    // wind speed (last ref: index 5 + nSources + nLinks + nLines in the scalar kernel)
+    refs.push(P.wind ? { data: flatten(P.wind.speed), mode: 0, n: P.wind.speed.length } : { data: [], mode: 0, n: 0 });
     const header = 1 + 4 * refs.length;
     const total = header + refs.reduce((a, r) => a + r.data.length, 0);
     const ser = new Float32Array(total);
@@ -475,7 +485,7 @@ export class GpuEngine implements Engine {
     f[22] = this.dx * this.dy;
     const code = (s: (typeof SIDES)[number]): number => {
       const t = P.boundaries[s].type;
-      return t === 'wall' ? 0 : t === 'open' ? 1 : 2;
+      return t === 'wall' ? 0 : t === 'open' ? 1 : t === 'ocean' ? 3 : 2;
     };
     u[24] = code('west');
     u[25] = code('east');
@@ -490,6 +500,18 @@ export class GpuEngine implements Engine {
     u[34] = this.statsGroups;
     u[23] = this.nLinks;
     u[35] = this.nLines;
+    // rotation, wind and open-sea currents (docs/ALGORITHMS.md §7, §8.4)
+    f[36] = P.coriolis;
+    u[37] = P.wind ? 1 : 0;
+    if (P.wind) {
+      const a = (P.wind.direction * Math.PI) / 180;
+      f[38] = -Math.sin(a);
+      f[39] = -Math.cos(a);
+      f[48] = P.wind.densityRatio;
+    }
+    f[49] = Math.max(P.hDry, WIND_MIN_DEPTH);
+    const vel = (b: BoundarySpec): [number, number] => (b.type === 'ocean' ? [b.u, b.v] : [0, 0]);
+    f.set([...vel(P.boundaries.west), ...vel(P.boundaries.east), ...vel(P.boundaries.south), ...vel(P.boundaries.north)], 40);
     this.dev.queue.writeBuffer(this.buf.P, 0, ab);
     // per-batch control header (accumulators are batch-relative; the CPU keeps double-precision totals)
     const hdr = new ArrayBuffer(K.CTRL_LEVELS_OFFSET);

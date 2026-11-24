@@ -6,7 +6,9 @@
  *      well-balanced (lake at rest), positivity preserving, accurate for thin layers on steep slopes
  *  - Optional 2nd order: MUSCL (minmod) reconstruction of (eta, h, u, v) + Heun (SSP-RK2)
  *  - Fully implicit Manning friction (solved exactly for the momentum magnitude)
- *  - Boundary conditions via two layers of ghost cells: wall / open / water level series / tide
+ *  - Coriolis force (f-plane, exact rotation of the momentum) and wind stress (Wu 1982 drag law)
+ *  - Boundary conditions via two layers of ghost cells: wall / open / water level series / tide /
+ *    open sea (external level + current as the far-field state of a Riemann problem)
  *  - Mass sources: point inflows, rainfall, constant infiltration
  *  - Spatially varying Manning roughness (per-cell field)
  *  - Hydraulic structures: time-varying beds along lines (gates, breaches) and culverts/pumps
@@ -14,6 +16,7 @@
  *  - Mass balance audit and result envelopes (max depth, max speed, max hazard, arrival time)
  *
  * Pure TypeScript, no DOM dependencies: used by the Web Worker and by the unit tests.
+ * Algorithm documentation (equations, discretisation, verification): docs/ALGORITHMS.md.
  */
 import { integrateSeries, sampleSeries, type TimeSeries } from './timeseries';
 
@@ -24,7 +27,46 @@ export type BoundarySpec =
   | { type: 'wall' }
   | { type: 'open' }
   | { type: 'level'; series: TimeSeries }
-  | { type: 'tide'; mean: number; amplitude: number; period: number; phase: number };
+  | { type: 'tide'; mean: number; amplitude: number; period: number; phase: number }
+  /**
+   * Open sea (docs/ALGORITHMS.md §8.4): the external level (mean + sinusoidal tide) and the external current
+   * (u east, v north, m/s) form the far-field state of a Riemann problem at the boundary — a characteristic
+   * (Flather-type) condition that lets outgoing linear waves leave without reflection. With rotation the
+   * level carries the geostrophic tilt of the external current.
+   */
+  | { type: 'ocean'; mean: number; amplitude: number; period: number; phase: number; u: number; v: number };
+
+/** Uniform wind over the domain (docs/ALGORITHMS.md §7.3). */
+export interface WindSpec {
+  /** Wind speed 10 m above the surface (m/s) over time. */
+  speed: TimeSeries;
+  /** Direction the wind blows FROM, degrees clockwise from north (meteorological convention). */
+  direction: number;
+  /** Air / water density ratio (1.225 / 1000 fresh water, 1.225 / 1025 sea water). */
+  densityRatio: number;
+}
+
+/** Earth's rotation rate (rad/s). */
+export const OMEGA = 7.2921e-5;
+/** Coriolis parameter f = 2 Ω sin φ (1/s) for a latitude in degrees. */
+export function coriolisParameter(latitudeDeg: number): number {
+  return 2 * OMEGA * Math.sin((latitudeDeg * Math.PI) / 180);
+}
+/** Wind drag coefficient of Wu (1982), Cd = (0.8 + 0.065 W) e-3, capped at 2.5e-3 for very strong winds. */
+export function windDragCoefficient(W: number): number {
+  return Math.min(2.5e-3, (0.8 + 0.065 * Math.max(0, W)) * 1e-3);
+}
+/** Kinematic wind stress tau / rho_w (m^2/s^2) at time t, as (east, north) components. */
+export function windStress(w: WindSpec, t: number): [number, number] {
+  const W = Math.max(0, sampleSeries(w.speed, t));
+  if (W === 0) return [0, 0];
+  const s = w.densityRatio * windDragCoefficient(W) * W * W;
+  const a = (w.direction * Math.PI) / 180;
+  // blowing FROM `direction` means blowing TOWARDS direction + 180°
+  return [-s * Math.sin(a), -s * Math.cos(a)];
+}
+/** Wind stress acts only where the water is deeper than this (m): thin films are friction dominated. */
+export const WIND_MIN_DEPTH = 0.01;
 
 export interface SourceSpec {
   /** Position in local metres (origin = south-west corner of the domain). */
@@ -105,6 +147,10 @@ export interface SolverParams {
   lines: DynamicLineSpec[];
   /** Culverts and pumps. */
   links: LinkSpec[];
+  /** Coriolis parameter f (1/s), 0 = no rotation (f-plane approximation). */
+  coriolis: number;
+  /** Uniform wind stress, null = none. */
+  wind: WindSpec | null;
 }
 
 export interface GridSpec {
@@ -130,6 +176,8 @@ export function defaultSolverParams(): SolverParams {
     manningField: null,
     lines: [],
     links: [],
+    coriolis: 0,
+    wind: null,
   };
 }
 
@@ -155,8 +203,19 @@ export function culvertDischarge(
 
 export function boundaryLevel(spec: BoundarySpec, t: number): number {
   if (spec.type === 'level') return sampleSeries(spec.series, t);
-  if (spec.type === 'tide') return spec.mean + spec.amplitude * Math.sin((2 * Math.PI * t) / spec.period + (spec.phase * Math.PI) / 180);
+  if (spec.type === 'tide' || spec.type === 'ocean') {
+    if (!(spec.amplitude !== 0 && spec.period > 0)) return spec.mean;
+    return spec.mean + spec.amplitude * Math.sin((2 * Math.PI * t) / spec.period + (spec.phase * Math.PI) / 180);
+  }
   return NaN;
+}
+
+/**
+ * Geostrophic surface tilt of an external current on the f-plane: g grad(eta) = -f k x U, i.e.
+ * eta(x, y) = eta0 + (f / g) (v (x - xc) - u (y - yc)) about the domain centre (xc, yc).
+ */
+export function geostrophicTilt(f: number, g: number, u: number, v: number, x: number, y: number, xc: number, yc: number): number {
+  return f === 0 ? 0 : (f / g) * (v * (x - xc) - u * (y - yc));
 }
 
 /**
@@ -283,10 +342,12 @@ function minmodHalf(a: number, b: number): number {
 const BC_WALL = 0;
 const BC_OPEN = 1;
 const BC_LEVEL = 2;
+const BC_OCEAN = 3;
 
 function bcCode(spec: BoundarySpec): number {
   if (spec.type === 'wall') return BC_WALL;
   if (spec.type === 'open') return BC_OPEN;
+  if (spec.type === 'ocean') return BC_OCEAN;
   return BC_LEVEL;
 }
 
@@ -540,8 +601,11 @@ export class SWESolver {
   }
 
   /**
-   * Bed elevation in ghost cells: walls are mirrored; open (zero-gradient) and level boundaries copy the
-   * boundary cell (flat continuation keeps a lake at rest balanced at the boundary).
+   * Bed elevation in ghost cells (docs/ALGORITHMS.md §8.5): walls are mirrored; level / tide / open-sea
+   * boundaries copy the boundary cell (flat continuation keeps a lake at rest balanced at the boundary);
+   * free outflow continues a downhill bed (normal-depth assumption, friction slope = bed slope). A flat
+   * continuation there would act like a pool at the outlet and raise the water level far upstream
+   * (M1 backwater: +80 % depth at the outlet of a 0.1 % channel in the manning-normal verification case).
    */
   private fillBedGhosts(): void {
     const { nx, ny, NX, z } = this;
@@ -550,6 +614,10 @@ export class SWESolver {
       if (type === 'wall') {
         z[g1] = z[p0];
         z[g2] = n > 1 ? z[p1] : z[p0];
+      } else if (type === 'open' && n > 1) {
+        const drop = Math.max(0, z[p1] - z[p0]);
+        z[g1] = z[p0] - drop;
+        z[g2] = z[p0] - 2 * drop;
       } else {
         z[g1] = z[p0];
         z[g2] = z[p0];
@@ -569,10 +637,11 @@ export class SWESolver {
     }
   }
 
-  /** Fill ghost cell states for time t. */
+  /** Fill ghost cell states for time t (docs/ALGORITHMS.md §8). */
   private applyBoundaries(t: number): void {
-    const { nx, ny, NX } = this;
-    const B = this.params.boundaries;
+    const { nx, ny, NX, dx, dy } = this;
+    const P = this.params;
+    const B = P.boundaries;
     const cw = bcCode(B.west);
     const ce = bcCode(B.east);
     const cs = bcCode(B.south);
@@ -581,28 +650,51 @@ export class SWESolver {
     const le = boundaryLevel(B.east, t);
     const ls = boundaryLevel(B.south, t);
     const ln = boundaryLevel(B.north, t);
+    // open-sea boundaries: external current and the geostrophic tilt of the level along the boundary
+    const Lx = nx * dx;
+    const Ly = ny * dy;
+    const f = P.coriolis;
+    const g = P.gravity;
+    const ext = (s: BoundarySpec): [number, number] => (s.type === 'ocean' ? [s.u, s.v] : [0, 0]);
+    const [uw, vw] = ext(B.west);
+    const [ue, ve] = ext(B.east);
+    const [us, vs] = ext(B.south);
+    const [un, vn] = ext(B.north);
     for (let j = 0; j < ny; j++) {
+      const y = (j + 0.5) * dy;
       const p0 = this.idx(0, j);
-      this.ghost(cw, lw, p0, p0 + 1, p0 - 1, p0 - 2, 0, -1);
+      this.ghost(cw, cw === BC_OCEAN ? lw + geostrophicTilt(f, g, uw, vw, 0, y, Lx / 2, Ly / 2) : lw, p0, p0 + 1, p0 - 1, p0 - 2, 0, -1, uw, vw);
       const pe = this.idx(nx - 1, j);
-      this.ghost(ce, le, pe, pe - 1, pe + 1, pe + 2, 0, 1);
+      this.ghost(ce, ce === BC_OCEAN ? le + geostrophicTilt(f, g, ue, ve, Lx, y, Lx / 2, Ly / 2) : le, pe, pe - 1, pe + 1, pe + 2, 0, 1, ue, ve);
     }
     for (let i = 0; i < nx; i++) {
+      const x = (i + 0.5) * dx;
       const ps = this.idx(i, 0);
-      this.ghost(cs, ls, ps, ps + NX, ps - NX, ps - 2 * NX, 1, -1);
+      this.ghost(cs, cs === BC_OCEAN ? ls + geostrophicTilt(f, g, us, vs, x, 0, Lx / 2, Ly / 2) : ls, ps, ps + NX, ps - NX, ps - 2 * NX, 1, -1, us, vs);
       const pn = this.idx(i, ny - 1);
-      this.ghost(cn, ln, pn, ny > 1 ? pn - NX : pn, pn + NX, pn + 2 * NX, 1, 1);
+      this.ghost(cn, cn === BC_OCEAN ? ln + geostrophicTilt(f, g, un, vn, x, Ly, Lx / 2, Ly / 2) : ln, pn, ny > 1 ? pn - NX : pn, pn + NX, pn + 2 * NX, 1, 1, un, vn);
     }
   }
 
   /**
    * p0/p1: first/second interior cell from the boundary; g1/g2: first/second ghost cell.
    * axis 0: normal is x (hu), axis 1: normal is y (hv); sgn: +1 if the outward normal points to +axis.
+   * level: imposed water level (level/tide/ocean); ue/ve: external current of an open-sea boundary.
    */
-  private ghost(code: number, level: number, p0: number, p1: number, g1: number, g2: number, axis: number, sgn: number): void {
+  private ghost(code: number, level: number, p0: number, p1: number, g1: number, g2: number, axis: number, sgn: number, ue = 0, ve = 0): void {
     const h = this.h;
     const hu = this.hu;
     const hv = this.hv;
+    if (code === BC_OCEAN) {
+      // Far-field state (eta_ext, u_ext, v_ext): the Riemann solver at the boundary face takes the incoming
+      // characteristic from it and the outgoing one from the interior (non-reflecting for linear waves).
+      let hb = level - this.z[g1];
+      if (!(hb > this.params.hDry)) hb = 0;
+      h[g1] = h[g2] = hb;
+      hu[g1] = hu[g2] = hb * ue;
+      hv[g1] = hv[g2] = hb * ve;
+      return;
+    }
     // free outflow: zero-gradient while the boundary cell flows outwards, reflective otherwise
     // (a transmissive ghost would otherwise feed water into the domain wherever the flow points inwards)
     if (code === BC_OPEN && sgn * (axis === 0 ? hu[p0] : hv[p0]) < 0) code = BC_WALL;
@@ -775,11 +867,29 @@ export class SWESolver {
   }
 
   /**
-   * Conservative update. stage 0/1: U <- U + dt L(U); stage 2: U <- (U0 + U + dt L(U)) / 2.
+   * Conservative update. stage 0/1: U <- U + dt L(U); stage 2: U <- (U0 + F(U + dt L(U))) / 2.
+   * In the two Heun stages the implicit friction F is applied inside each stage (IMEX SSP-RK2): uniform
+   * flow is then an exact fixed point; applying it once after the full step lets stage 2 transport
+   * momentum accelerated without friction (≈1 % discharge error in the manning-normal case, §6.2).
    */
   private updateCells(dt: number, stage: number): void {
     const { nx, ny, NX } = this;
     const g = this.params.gravity;
+    const P = this.params;
+    const fr = stage !== 0;
+    const n2gU = g * P.manning * P.manning;
+    const mf = P.manningField;
+    const hd = P.hDry;
+    /** Implicit Manning friction over dt on a provisional state (returns the momentum scale factor). */
+    const frictionScale = (hh: number, qx: number, qy: number, c: number): number => {
+      if (!(hh > hd)) return 1;
+      const q = Math.sqrt(qx * qx + qy * qy);
+      if (!(q > 0)) return 1;
+      const n2g = mf ? g * mf[c] * mf[c] : n2gU;
+      if (!(n2g > 0)) return 1;
+      const a = (dt * n2g) / (hh * hh * Math.cbrt(hh));
+      return 2 / (1 + Math.sqrt(1 + 4 * a * q));
+    };
     const rdx = 1 / this.dx;
     const rdy = 1 / this.dy;
     const h = this.h;
@@ -818,13 +928,24 @@ export class SWESolver {
         let qx: number;
         let qy: number;
         if (stage === 2) {
-          hn = 0.5 * (h0[p] + h[p] + dt * dh);
-          qx = 0.5 * (hu0[p] + hu[p] + dt * dqx);
-          qy = 0.5 * (hv0[p] + hv[p] + dt * dqy);
+          const wh = h[p] + dt * dh;
+          let wx = hu[p] + dt * dqx;
+          let wy = hv[p] + dt * dqy;
+          const r = frictionScale(wh, wx, wy, ky);
+          wx *= r;
+          wy *= r;
+          hn = 0.5 * (h0[p] + wh);
+          qx = 0.5 * (hu0[p] + wx);
+          qy = 0.5 * (hv0[p] + wy);
         } else {
           hn = h[p] + dt * dh;
           qx = hu[p] + dt * dqx;
           qy = hv[p] + dt * dqy;
+          if (fr) {
+            const r = frictionScale(hn, qx, qy, ky);
+            qx *= r;
+            qy *= r;
+          }
         }
         if (hn < 0) {
           clip -= hn;
@@ -840,8 +961,11 @@ export class SWESolver {
     this.clipVol += clip * this.dx * this.dy;
   }
 
-  /** Mass sources, implicit friction, cleanup, statistics and envelopes. */
-  private postStep(dt: number): void {
+  /**
+   * Mass sources, wind, implicit friction (first order only: the Heun stages apply it themselves),
+   * velocity cap, Coriolis rotation, cleanup, statistics and envelopes.
+   */
+  private postStep(dt: number, frictionDone = false): void {
     const { nx, ny, NX, dx, dy } = this;
     const P = this.params;
     const h = this.h;
@@ -916,6 +1040,16 @@ export class SWESolver {
     const mf = P.manningField;
     const hd = P.hDry;
     const vcap = P.velocityCap;
+    // wind stress (explicit, sampled at mid-step) and Coriolis rotation by f dt (exact for the inertial
+    // oscillation; commutes with the isotropic implicit friction and the velocity cap) — ALGORITHMS.md §7
+    let twx = 0;
+    let twy = 0;
+    if (P.wind) [twx, twy] = windStress(P.wind, t0 + 0.5 * dt);
+    const windOn = twx !== 0 || twy !== 0;
+    const wMin = Math.max(hd, WIND_MIN_DEPTH);
+    const fc = P.coriolis;
+    const cosT = fc !== 0 ? Math.cos(fc * dt) : 1;
+    const sinT = fc !== 0 ? Math.sin(fc * dt) : 0;
     const tNew = t1;
     const arrDepth = P.arrivalDepth;
     const maxH = this.maxH;
@@ -950,9 +1084,13 @@ export class SWESolver {
             hn = 0;
           }
         } else {
+          if (windOn && hn > wMin) {
+            qx += dt * twx;
+            qy += dt * twy;
+          }
           let q = Math.sqrt(qx * qx + qy * qy);
           if (q > 0) {
-            const n2g = mf ? g * mf[c] * mf[c] : n2gU;
+            const n2g = frictionDone ? 0 : mf ? g * mf[c] * mf[c] : n2gU;
             if (n2g > 0) {
               const a = (dt * n2g) / (hn * hn * Math.cbrt(hn));
               const qn = (2 * q) / (1 + Math.sqrt(1 + 4 * a * q));
@@ -966,6 +1104,12 @@ export class SWESolver {
               qx *= r;
               qy *= r;
               q = vcap * hn;
+            }
+            if (fc !== 0) {
+              // du/dt = f v, dv/dt = -f u: clockwise rotation by f dt in the northern hemisphere
+              const rx = cosT * qx + sinT * qy;
+              qy = cosT * qy - sinT * qx;
+              qx = rx;
             }
           }
           // Statistics and envelopes
@@ -1109,7 +1253,7 @@ export class SWESolver {
       this.accumulateBoundaryFlux(dt);
       this.updateCells(dt, 0);
     }
-    this.postStep(dt);
+    this.postStep(dt, second);
     this.t = t + dt;
     this.stepCount++;
     this.lastDt = dt;

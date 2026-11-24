@@ -146,6 +146,23 @@ export interface LinkDef {
   series: TimeSeries;
 }
 
+/** Large-scale physics: Coriolis force (f-plane) and uniform wind stress (docs/ALGORITHMS.md §7). */
+export interface PhysicsDef {
+  coriolis: boolean;
+  /** Latitude (degrees north, negative south) for f = 2Ω sin φ. */
+  latitude: number;
+  wind: {
+    enabled: boolean;
+    /** Speed 10 m above the surface (m/s) over time. */
+    speed: TimeSeries;
+    /** Direction the wind blows FROM (degrees clockwise from north). */
+    direction: number;
+    origin?: string;
+  };
+  /** Water density (kg/m^3): 1000 fresh water, 1025 sea water. */
+  waterDensity: number;
+}
+
 export interface SimSettings {
   /** Simulated duration (s). */
   duration: number;
@@ -167,6 +184,7 @@ export type ColorMode =
   | 'wse'
   | 'froude'
   | 'hazard'
+  | 'shear'
   | 'maxDepth'
   | 'maxSpeed'
   | 'maxHazard'
@@ -200,7 +218,12 @@ export interface Scenario {
   description: string;
   manning: number;
   boundaries: Record<Side, BoundarySpec>;
-  initial: { baseLevel: number | null; regions: RegionDef[] };
+  initial: {
+    baseLevel: number | null;
+    regions: RegionDef[];
+    /** Uniform initial current (m/s) in wet cells; absent = at rest. */
+    velocity?: { u: number; v: number };
+  };
   sources: SourceDef[];
   rainfall: RainfallDef;
   simulation: SimSettings;
@@ -214,6 +237,8 @@ export interface Scenario {
   buildings?: BuildingsDef;
   structures?: StructureLine[];
   links?: LinkDef[];
+  /** Coriolis force and wind (optional for backward compatibility). */
+  physics?: PhysicsDef;
 }
 
 export interface LoadedCase {

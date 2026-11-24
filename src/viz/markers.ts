@@ -14,6 +14,7 @@ export const MARKER_COLORS = {
   open: '#34d399',
   level: '#3b82f6',
   tide: '#818cf8',
+  ocean: '#38bdf8',
   rough: '#86efac',
   building: '#fb923c',
   levee: '#d6a26c',
@@ -165,7 +166,7 @@ export class MarkerLayer {
       for (const side of ['south', 'east', 'north', 'west'] as Side[]) {
         const spec: BoundarySpec = sc.boundaries[side];
         const col = MARKER_COLORS[spec.type];
-        this.group.add(this.draped(edges[side], false, col, lift * 1.5, 2, spec.type === 'open'));
+        this.group.add(this.draped(edges[side], false, col, lift * 1.5, 2, spec.type === 'open' || spec.type === 'ocean'));
       }
     }
     // initial-condition regions

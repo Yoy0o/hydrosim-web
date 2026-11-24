@@ -23,11 +23,19 @@ export function initialDepth(
   g: GridLike,
   baseLevel: number | null,
   regions: { polygon: [number, number][]; level: number }[],
+  /** Optional offset of the base level with position (e.g. the geostrophic tilt of an initial current). */
+  tilt?: (x: number, y: number) => number,
 ): Float32Array {
   const { nx, ny, dx, dy, z } = g;
   const h = new Float32Array(nx * ny);
   if (baseLevel !== null && Number.isFinite(baseLevel)) {
-    for (let k = 0; k < nx * ny; k++) h[k] = Math.max(0, baseLevel - z[k]);
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const k = j * nx + i;
+        const lv = tilt ? baseLevel + tilt((i + 0.5) * dx, (j + 0.5) * dy) : baseLevel;
+        h[k] = Math.max(0, lv - z[k]);
+      }
+    }
   }
   for (const r of regions) {
     if (r.polygon.length < 3) continue;
